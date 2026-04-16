@@ -1,7 +1,7 @@
 {
   "database": "dolt",
   "backend": "dolt",
-  "dolt_mode": "embedded",
+  "dolt_mode": "server",
   "dolt_database": "openclaw",
   "project_id": "ae6c97a3-44ef-4a6c-b7b8-4cf2bd4dc4ef"
 }
