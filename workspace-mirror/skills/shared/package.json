@@ -6,7 +6,8 @@
   "exports": {
     "./constants": "./constants.js",
     "./telegram-client": "./telegram-client.js",
-    "./draft-store": "./draft-store.js"
+    "./draft-store": "./draft-store.js",
+    "./schemas": "./schemas.js"
   },
   "scripts": {
     "test": "vitest run",
