@@ -26,6 +26,12 @@
 - Run tests with: `cd workspace-mirror/skills/<name> && npm test`
 - Never commit `node_modules/` — every skill has `node_modules/` gitignored.
 
+**Import conventions (pinned — every task must follow):**
+- Inside a skill's `index.js`, sub-modules, and `tests/`: import from `shared` via the bare specifier with subpath: `import { validateTranscript } from "shared/schemas";` and `import { createSourcesStore } from "shared/sources-store";`. This works because every skill has `"shared": "file:../shared"` in its deps and `shared/package.json` declares the subpath exports.
+- Inside a skill's `bin/*.js`: ALSO use the bare specifier (`shared/...`). The CLI is run with the skill as cwd, so Node resolves `shared` via the skill's `node_modules/shared` symlink.
+- Cross-skill imports from `bin/*.js` (e.g., `provider-router/router.js`) use **relative paths**: `import { createRouter } from "../../provider-router/router.js";`. Provider-router is a sibling skill, not a published dep.
+- Never mix styles in the same file. The above is the rule; deviations are review failures.
+
 ---
 
 ## File Structure
@@ -368,8 +374,7 @@ Edit `workspace-mirror/skills/shared/package.json`:
     "./constants": "./constants.js",
     "./telegram-client": "./telegram-client.js",
     "./draft-store": "./draft-store.js",
-    "./schemas": "./schemas.js",
-    "./sources-store": "./sources-store.js"
+    "./schemas": "./schemas.js"
   },
   "scripts": {
     "test": "vitest run",
@@ -381,7 +386,7 @@ Edit `workspace-mirror/skills/shared/package.json`:
 }
 ```
 
-(Adding `./sources-store` now even though Task 2 creates the file — it's declared for task 2's convenience.)
+(Task 2 will add the `./sources-store` export when that file actually exists — keeping subpath exports in lockstep with their files prevents stale package-lock issues.)
 
 - [ ] **Step 1.5: Run tests — expect pass**
 
@@ -409,17 +414,34 @@ git commit -m "feat(shared): add Transcript/Storyboard/Candidate schema validato
 **Files:**
 - Create: `workspace-mirror/skills/shared/sources-store.js`
 - Create: `workspace-mirror/skills/shared/tests/sources-store.test.js`
-- Modify: `workspace-mirror/skills/shared/package.json` (already added in Task 1)
-- Modify: `workspace-mirror/skills/shared/package.json` — add `js-yaml` dependency
+- Modify: `workspace-mirror/skills/shared/package.json` — add `./sources-store` export AND `js-yaml` dep
 
-- [ ] **Step 2.1: Add `js-yaml` dep to shared**
+- [ ] **Step 2.1: Add `./sources-store` export and `js-yaml` dep**
 
-Edit `workspace-mirror/skills/shared/package.json`:
+Edit `workspace-mirror/skills/shared/package.json` so the exports + dependencies look like:
 
 ```json
 {
+  "name": "shared",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "exports": {
+    "./constants": "./constants.js",
+    "./telegram-client": "./telegram-client.js",
+    "./draft-store": "./draft-store.js",
+    "./schemas": "./schemas.js",
+    "./sources-store": "./sources-store.js"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
   "dependencies": {
     "js-yaml": "^4.1.0"
+  },
+  "devDependencies": {
+    "vitest": "^2.0.0"
   }
 }
 ```
@@ -741,14 +763,38 @@ describe("research", () => {
     await expect(r.run("unknown-niche")).rejects.toThrow(/unknown-niche/);
   });
 
-  it("falls back to RSS-only when browser fails 3× consecutively", async () => {
+  it("falls back to RSS-only when browser fails 3× consecutively (queries=1, so 1 failure = silent skip)", async () => {
     const deps = makeDeps({
       browserSearch: vi.fn(async () => { throw new Error("browser flake"); }),
     });
     const r = createResearch(deps);
     const topics = await r.run("ai");
-    expect(topics.length).toBeGreaterThan(0); // didn't abort
-    expect(deps.browserSearch).toHaveBeenCalledTimes(1); // queries array length 1
+    expect(topics.length).toBeGreaterThan(0); // didn't abort — RSS supplied content
+    expect(deps.browserSearch).toHaveBeenCalledTimes(1); // tried once, failed, stopped (only 1 query in fixture)
+  });
+
+  it("stops calling browserSearch after 3 consecutive failures", async () => {
+    const nichesYamlMany = `
+niches:
+  ai:
+    rss:
+      - https://example.com/ai.xml
+    web_search_queries:
+      - "q1 {today}"
+      - "q2 {today}"
+      - "q3 {today}"
+      - "q4 {today}"
+      - "q5 {today}"
+    keywords_must_include: [ai]
+    keywords_must_exclude: []
+`;
+    const deps = makeDeps({
+      readFileSync: vi.fn(() => nichesYamlMany),
+      browserSearch: vi.fn(async () => { throw new Error("flake"); }),
+    });
+    const r = createResearch(deps);
+    await r.run("ai");
+    expect(deps.browserSearch).toHaveBeenCalledTimes(3); // bailed after 3 consecutive failures
   });
 });
 ```
@@ -839,16 +885,19 @@ export function createResearch({ readFileSync, nichesPath, fetchRss, browserSear
       rssItems.push(...items.map((i) => ({ title: i.title, source_url: i.link })));
     }
 
-    // 2. Web search (with flake tolerance)
+    // 2. Web search (with flake tolerance — abort to RSS-only after 3 consecutive failures)
     const today = new Date().toISOString().slice(0, 10);
     const webItems = [];
+    let consecutiveFailures = 0;
     for (const qTemplate of cfg.web_search_queries || []) {
+      if (consecutiveFailures >= 3) break;  // give up; RSS-only fallback
       const q = qTemplate.replaceAll("{today}", today);
       try {
         const hits = await browserSearch(q);
         webItems.push(...hits.map((h) => ({ title: h.title, source_url: h.url })));
+        consecutiveFailures = 0;
       } catch {
-        // browser flake: skip this query, continue
+        consecutiveFailures++;
       }
     }
 
@@ -2098,8 +2147,21 @@ if __name__ == "__main__":
 
 ```js
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 
 export function createRenderCard({ pythonBin = "python3", scriptPath }) {
+  // Verify the Python interpreter exists at construction time so failures
+  // surface early, not deep inside an opaque spawn ENOENT.
+  if (pythonBin.startsWith("/") && !existsSync(pythonBin)) {
+    throw new Error(
+      `createRenderCard: Python interpreter not found at "${pythonBin}". ` +
+      `Run Phase 1 install: python3 -m venv ~/.openclaw/workspace/.venv && ` +
+      `~/.openclaw/workspace/.venv/bin/pip install Pillow`
+    );
+  }
+  if (!existsSync(scriptPath)) {
+    throw new Error(`createRenderCard: render.py not found at "${scriptPath}"`);
+  }
   return async function renderCard(spec, outPath) {
     return new Promise((resolve, reject) => {
       const proc = spawn(pythonBin, [scriptPath]);
@@ -3012,10 +3074,29 @@ export function buildClipSrt(segments, startS, endS) {
 ```js
 import { spawn } from "node:child_process";
 
+// FFmpeg's filtergraph lexer treats : , [ ] ' \ as metacharacters inside
+// option values. Inside subtitles=<path>, the path needs : -> \: , \ -> \\ ,
+// ' -> \\\' . See https://ffmpeg.org/ffmpeg-filters.html#Notes-on-filtergraph-escaping
+function escapeFilterPath(p) {
+  return p
+    .replace(/\\/g, "\\\\")
+    .replace(/:/g, "\\:")
+    .replace(/'/g, "\\\\'")
+    .replace(/,/g, "\\,")
+    .replace(/\[/g, "\\[")
+    .replace(/\]/g, "\\]");
+}
+
+export { escapeFilterPath };
+
 export function createFfmpegRunner({ binary = "ffmpeg" } = {}) {
   return async function runFfmpeg({ startS, endS, inputPath, outputPath, srtPath }) {
-    // Build the filter string. NOTE: subtitles=path escapes any commas/colons via :
-    const vf = `scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,subtitles=${srtPath}:force_style='FontName=Inter,Fontsize=28,Alignment=2,OutlineColour=&H00000000,BorderStyle=3'`;
+    const escapedSrt = escapeFilterPath(srtPath);
+    const vf = [
+      "scale=1080:1920:force_original_aspect_ratio=increase",
+      "crop=1080:1920",
+      `subtitles=${escapedSrt}:force_style='FontName=Inter,Fontsize=28,Alignment=2,OutlineColour=&H00000000,BorderStyle=3'`,
+    ].join(",");
     const args = [
       "-y",
       "-ss", String(startS),
@@ -3038,6 +3119,27 @@ export function createFfmpegRunner({ binary = "ffmpeg" } = {}) {
     });
   };
 }
+```
+
+Add unit test for escape function — append to `tests/srt.test.js` (or create `tests/ffmpeg.test.js`):
+
+```js
+import { escapeFilterPath } from "../ffmpeg.js";
+
+describe("escapeFilterPath", () => {
+  it("escapes colons", () => {
+    expect(escapeFilterPath("/tmp/foo:bar")).toBe("/tmp/foo\\:bar");
+  });
+  it("escapes single quotes", () => {
+    expect(escapeFilterPath("/tmp/it's.srt")).toBe("/tmp/it\\\\'s.srt");
+  });
+  it("escapes commas, brackets, backslashes", () => {
+    expect(escapeFilterPath("/p[a],b\\c")).toBe("/p\\[a\\]\\,b\\\\c");
+  });
+  it("leaves a clean path untouched", () => {
+    expect(escapeFilterPath("/tmp/clip.srt")).toBe("/tmp/clip.srt");
+  });
+});
 ```
 
 - [ ] **Step 9.7: Implement `index.js`**
@@ -3328,20 +3430,35 @@ cd workspace-mirror/skills/poller && npm test -- tests/source-callback.test.js
 
 - [ ] **Step 10.6: Wire `s:` dispatch + provider-router into `bin/poll.js`**
 
-Edit `workspace-mirror/skills/poller/bin/poll.js` — locate the callback dispatcher and add the `s:` branch before the existing `a:` / `m:` / `r:` branches. Also inject a real provider-router instead of `null`.
+**Important: this task modifies an existing M1 file. Subagents must read the current `bin/poll.js` in full before making changes.** The integration points are:
 
-Add near imports:
+1. The `import` block at the top of the file
+2. The `router` initialization (currently `const router = null;`)
+3. The `callback_query` dispatch (currently checks `a:` / `m:` / `r:` prefixes)
+4. The slash-command dispatch (currently handles `/mode`, `/status`, etc.)
+
+For each edit point below, the plan shows the BEFORE pattern to find with `Grep`, and the AFTER replacement.
+
+**Edit point 1 — imports.** Find the existing top-of-file imports (look for `from "node:fs"` and `from "shared/...`). Append these AFTER the last existing import:
 
 ```js
 import { createRouter } from "../../provider-router/router.js";
 import ollama from "../../provider-router/providers/ollama.js";
 import anthropic from "../../provider-router/providers/anthropic.js";
-import { createSourcesStore } from "../../shared/sources-store.js";
+import { createSourcesStore } from "shared/sources-store";
 import { createSourceCallbackHandler } from "../source-callback.js";
-import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, renameSync } from "node:fs";
+import { appendFileSync, mkdirSync, renameSync } from "node:fs";
 ```
 
-Replace the `router = null` line with:
+(`readFileSync`, `writeFileSync`, `existsSync` are likely already imported; add only what's missing.)
+
+**Edit point 2 — router init.** Find:
+
+```js
+const router = null;
+```
+
+Replace with:
 
 ```js
 const router = createRouter({
@@ -3351,7 +3468,7 @@ const router = createRouter({
 });
 ```
 
-Instantiate source-callback:
+**Edit point 3 — source-callback handler instantiation.** After the router init, append:
 
 ```js
 const sourcesStore = createSourcesStore({ path: `${process.env.HOME}/.openclaw/workspace/config/sources.yaml` });
@@ -3377,7 +3494,7 @@ const sourceCb = createSourceCallbackHandler({
 });
 ```
 
-Add the `s:` branch to callback dispatch (inside the `callback_query` handler):
+**Edit point 4 — `s:` callback dispatch.** Find the callback_query loop that checks `callbackData.startsWith("a:")`. Add this branch BEFORE the `a:` check:
 
 ```js
 if (callbackData.startsWith("s:")) {
@@ -3387,7 +3504,7 @@ if (callbackData.startsWith("s:")) {
 }
 ```
 
-Add `/sources` slash commands (after existing slash-command handlers):
+**Edit point 5 — `/sources` slash commands.** Find the slash-command dispatcher (look for `text.startsWith("/mode")` or similar). Add this block in the same dispatcher, BEFORE the catch-all "unknown command" reply:
 
 ```js
 if (text.startsWith("/sources")) {
@@ -3458,9 +3575,16 @@ git commit -m "feat(poller): wire provider-router + s: callback dispatch + /sour
  *   rm -rf ~/openclaw-drafts/pending/smoke-*
  */
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const HOME = process.env.HOME;
-const WS = `${HOME}/.openclaw/workspace`;
+// Default: import from workspace-mirror (where this script lives) so
+// running pre-rsync still works. OPENCLAW_LIVE=1 → import from live workspace.
+const here = dirname(fileURLToPath(import.meta.url));
+const MIRROR = resolve(here, "..");
+const LIVE_WS = `${HOME}/.openclaw/workspace`;
+const WS = process.env.OPENCLAW_LIVE === "1" ? LIVE_WS : MIRROR;
 const DRAFTS = `${HOME}/openclaw-drafts`;
 const args = process.argv.slice(2);
 const LIVE = args.includes("--live");
@@ -3745,7 +3869,7 @@ git push
 
 ## Exit Criteria (M2 complete when all true)
 
-- [ ] All 8 skill test suites pass (shared, research, whitelist-scan, transcribe, slideshow-draft, quotecard-draft, source-discovery, clip-extract) — plus poller and existing M1 suites (approval, archive, provider-router)
+- [ ] All 9 test surfaces pass: `shared`, `research`, `whitelist-scan`, `transcribe`, `slideshow-draft`, `quotecard-draft`, `source-discovery`, `clip-extract`, `poller` — plus existing M1 `approval`, `archive`, and Plan A `provider-router` suites continue to pass
 - [ ] `bin/smoke-run.js --sandbox` produces 3 valid drafts in `/tmp/openclaw-smoke/pending/` with the expected files (draft.json, media/)
 - [ ] `bin/smoke-run.js` (live) delivers 3 Telegram DMs, all three buttons work per M1 flow, modify flow produces a regenerated draft
 - [ ] `source-discovery --url=<real channel>` → Telegram DM → approve → `sources.yaml` grows; reject → `rejected-sources.jsonl` grows; sources.yaml untouched
