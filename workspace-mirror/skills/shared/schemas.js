@@ -1,5 +1,8 @@
-function errs() {
-  return [];
+function topLevelGuard(obj) {
+  if (obj === null || typeof obj !== "object" || Array.isArray(obj)) {
+    return { valid: false, errors: ["input must be a non-null object"] };
+  }
+  return null;
 }
 
 function req(errors, obj, key, kind) {
@@ -15,7 +18,9 @@ function req(errors, obj, key, kind) {
 }
 
 export function validateTranscript(t) {
-  const errors = errs();
+  const guard = topLevelGuard(t);
+  if (guard) return guard;
+  const errors = [];
   req(errors, t, "source_id", "string");
   req(errors, t, "episode_id", "string");
   req(errors, t, "title", "string");
@@ -36,7 +41,9 @@ export function validateTranscript(t) {
 }
 
 export function validateStoryboard(s) {
-  const errors = errs();
+  const guard = topLevelGuard(s);
+  if (guard) return guard;
+  const errors = [];
   req(errors, s, "script", "string");
   req(errors, s, "duration_s", "number");
   if (!Array.isArray(s?.beats) || s.beats.length === 0) {
@@ -55,7 +62,9 @@ const ATTRIBUTION_PLACEHOLDERS = ["{episode_title}", "{episode_num}", "{creator}
 const VALID_DISCOVERY_MODES = new Set(["push", "pull"]);
 
 export function validateCandidate(c) {
-  const errors = errs();
+  const guard = topLevelGuard(c);
+  if (guard) return guard;
+  const errors = [];
   req(errors, c, "candidate_id", "string");
   req(errors, c, "discovered_at", "string");
   if (!VALID_DISCOVERY_MODES.has(c?.discovery_mode)) {

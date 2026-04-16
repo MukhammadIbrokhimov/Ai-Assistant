@@ -5,6 +5,21 @@ import {
   validateCandidate,
 } from "../schemas.js";
 
+describe("top-level input guards", () => {
+  it("rejects null without crashing", () => {
+    expect(validateTranscript(null).valid).toBe(false);
+    expect(validateStoryboard(null).valid).toBe(false);
+    expect(validateCandidate(null).valid).toBe(false);
+  });
+  it("rejects array input", () => {
+    expect(validateTranscript([]).valid).toBe(false);
+  });
+  it("rejects primitive input", () => {
+    expect(validateTranscript("hello").valid).toBe(false);
+    expect(validateStoryboard(42).valid).toBe(false);
+  });
+});
+
 describe("validateTranscript", () => {
   const valid = {
     source_id: "lex-fridman",
