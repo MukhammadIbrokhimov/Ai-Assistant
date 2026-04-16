@@ -1,0 +1,26 @@
+niches:
+  ai:
+    rss:
+      - https://www.theverge.com/ai-artificial-intelligence/rss/index.xml
+      - https://feeds.arstechnica.com/arstechnica/index
+      - https://hnrss.org/newest?q=AI+agent
+    web_search_queries:
+      - "AI agent release {today}"
+      - "open source LLM {today}"
+    keywords_must_include: [ai, llm, agent, model]
+    keywords_must_exclude: [crypto, web3]
+
+  finance:
+    rss:
+      - https://hnrss.org/newest?q=fintech
+    web_search_queries:
+      - "AI in finance {today}"
+      - "AI trading {today}"
+    keywords_must_include: [ai, finance, money, trading, fintech]
+
+  make-money-with-ai:
+    rss: []
+    web_search_queries:
+      - "make money with AI {today}"
+      - "AI side hustle {today}"
+    keywords_must_include: [ai, income, business, hustle]

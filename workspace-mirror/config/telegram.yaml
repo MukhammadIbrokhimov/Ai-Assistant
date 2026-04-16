@@ -1,0 +1,8 @@
+bot_token_env: TG_BOT_TOKEN
+dm_policy: pairing
+paired_user_id: 5349931800
+quiet_hours:
+  start: "22:00"
+  end: "08:00"
+  timezone: auto
+batch_quiet_drafts: true

@@ -1,0 +1,40 @@
+default_mode: local
+current_mode: local
+
+spend:
+  daily_cap_usd: 1.00
+  cost_per_million_tokens:
+    "anthropic:claude-haiku-4-5":   { in: 0.25, out: 1.25 }
+    "anthropic:claude-sonnet-4-6":  { in: 3.00, out: 15.00 }
+    "ollama:*":                     { in: 0.00, out: 0.00 }
+
+providers:
+  ollama:
+    adapter: ollama
+    base_url: http://127.0.0.1:11434
+    models:
+      fast:    llama3.1:8b
+      quality: qwen2.5:14b
+  anthropic:
+    adapter: anthropic
+    api_key_env: ANTHROPIC_API_KEY
+    models:
+      cheap:   claude-haiku-4-5
+      quality: claude-sonnet-4-6
+
+modes:
+  local:
+    bulk-classify: ollama:fast
+    extract:       ollama:quality
+    reason:        ollama:quality
+    write:         ollama:quality
+  hybrid:
+    bulk-classify: ollama:fast
+    extract:       ollama:quality
+    reason:        anthropic:cheap
+    write:         anthropic:quality
+  premium:
+    bulk-classify: anthropic:cheap
+    extract:       anthropic:cheap
+    reason:        anthropic:quality
+    write:         anthropic:quality
