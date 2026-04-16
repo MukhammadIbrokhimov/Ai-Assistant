@@ -65,4 +65,21 @@ describe("sources-store", () => {
     store.append({ id: "x", creator: "X", url: "u", license: "permission-granted" });
     expect(existsSync(sourcesPath + ".tmp")).toBe(false);
   });
+
+  it("steals a stale lock whose holder PID is dead", () => {
+    const lockPath = sourcesPath + ".lock";
+    writeFileSync(lockPath, "999999");
+    const store = createSourcesStore({ path: sourcesPath });
+    store.append({ id: "lex", creator: "Lex", url: "u", license: "permission-granted" });
+    expect(store.list()).toHaveLength(1);
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  it("steals an unreadable / corrupt lockfile", () => {
+    const lockPath = sourcesPath + ".lock";
+    writeFileSync(lockPath, "garbage-not-a-pid");
+    const store = createSourcesStore({ path: sourcesPath });
+    store.append({ id: "x", creator: "X", url: "u", license: "permission-granted" });
+    expect(store.list()).toHaveLength(1);
+  });
 });

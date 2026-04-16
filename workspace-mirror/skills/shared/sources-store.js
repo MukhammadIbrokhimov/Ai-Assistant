@@ -1,6 +1,16 @@
 import { readFileSync, writeFileSync, renameSync, openSync, closeSync, unlinkSync } from "node:fs";
 import yaml from "js-yaml";
 
+function isPidAlive(pid) {
+  if (!pid || !Number.isInteger(pid)) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e.code === "EPERM";
+  }
+}
+
 export function createSourcesStore({ path }) {
   function readAll() {
     const doc = yaml.load(readFileSync(path, "utf8")) || { sources: [] };
@@ -21,20 +31,39 @@ export function createSourcesStore({ path }) {
     while (Date.now() - start < 2000) {
       try {
         fd = openSync(lockPath, "wx");
+        writeFileSync(fd, String(process.pid));
         break;
       } catch (e) {
         if (e.code !== "EEXIST") throw e;
+        // Check whether the holder PID is still alive; if not, steal the lock.
+        try {
+          const holderPid = Number(readFileSync(lockPath, "utf8").trim());
+          if (!isPidAlive(holderPid)) {
+            unlinkSync(lockPath);
+            continue; // retry immediately
+          }
+        } catch {
+          // Stale lockfile is unreadable — treat as orphaned and steal.
+          try { unlinkSync(lockPath); } catch {}
+          continue;
+        }
         const end = Date.now() + 20;
         while (Date.now() < end) {}
       }
     }
     if (fd === null) throw new Error(`sources-store: lock timeout on ${lockPath}`);
-    try {
-      return fn();
-    } finally {
-      closeSync(fd);
-      try { unlinkSync(lockPath); } catch {}
+    const ret = (() => {
+      try {
+        return fn();
+      } finally {
+        closeSync(fd);
+        try { unlinkSync(lockPath); } catch {}
+      }
+    })();
+    if (ret && typeof ret.then === "function") {
+      throw new Error("sources-store.withLock: async fn not supported (lock would release before promise settles)");
     }
+    return ret;
   }
 
   function list() {
