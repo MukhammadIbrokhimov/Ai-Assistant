@@ -30,21 +30,21 @@ export async function handleCallback(cbq, { telegramClient, draftStore, archive 
 
   if (action === "approve") {
     await telegramClient.answerCallbackQuery(cbq.id, "Approved!");
+    draftStore.updateState(draftId, { status: STATUSES.APPROVED, resolved_at: now });
     await telegramClient.editMessageText(
       chatId,
       messageId,
       `~${draft.caption}~\n\n✅ Approved → posting queue`
-    );
-    draftStore.updateState(draftId, { status: STATUSES.APPROVED, resolved_at: now });
+    ).catch((err) => console.error(`editMessageText failed for ${draftId}:`, err));
     await archive.archiveDraft(draftId, { draftStore, telegramClient });
   } else if (action === "reject") {
     await telegramClient.answerCallbackQuery(cbq.id, "Rejected");
+    draftStore.updateState(draftId, { status: STATUSES.REJECTED, resolved_at: now });
     await telegramClient.editMessageText(
       chatId,
       messageId,
       `~${draft.caption}~\n\n❌ Rejected`
-    );
-    draftStore.updateState(draftId, { status: STATUSES.REJECTED, resolved_at: now });
+    ).catch((err) => console.error(`editMessageText failed for ${draftId}:`, err));
     await archive.archiveDraft(draftId, { draftStore, telegramClient });
   } else if (action === "modify") {
     const existing = draftStore.findModifying();

@@ -145,6 +145,22 @@ describe("/spend", () => {
     expect(text).toContain("$");
     expect(text).toContain("cap");
   });
+
+  test("cap N updates daily_cap_usd in providers.yaml", async () => {
+    const logPath = join(tmp, "router.jsonl");
+    const configPath = join(tmp, "providers.yaml");
+    writeFileSync(
+      configPath,
+      "spend:\n  daily_cap_usd: 1.00\n  cost_per_million_tokens: {}\n"
+    );
+    const cmd = createSpendCommand(logPath, configPath);
+    const client = mockClient();
+    await cmd(CHAT_ID, "cap 2.50", client);
+    const text = client.sendMessage.mock.calls[0][1];
+    expect(text).toContain("$2.50");
+    const updated = readFileSync(configPath, "utf8");
+    expect(updated).toContain("2.5");
+  });
 });
 
 describe("/whoami", () => {
