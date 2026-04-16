@@ -109,45 +109,59 @@ if (!existsSync(manifestPath) || !existsSync(transcriptDir)) {
   }
 }
 
-// 3. slideshow
-const pexels = createPexelsClient({ apiKey: process.env.PEXELS_API_KEY });
-const ss = createSlideshowDraft({
-  router,
-  pexelsSearch: pexels.searchOne,
-  writeDraft: (id, d) => {
-    const dir = `${draftsRoot}/pending/${id}`;
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(`${dir}/draft.json`, JSON.stringify(d, null, 2));
-  },
-  writeMedia: (p, c) => writeFileSync(p, c),
-  mkdirp: (p) => mkdirSync(p, { recursive: true }),
-  now: () => new Date(),
-  draftsRoot,
-  idGenerator: () => `smoke-${new Date().toISOString().slice(0, 10)}-slideshow-${Math.random().toString(36).slice(2, 6)}`,
-});
-const { draft: d2 } = await ss.run({ topic, niche: "ai" });
-console.log(`[smoke] slideshow draft: ${d2.id}`);
+// 3. slideshow (skipped if PEXELS_API_KEY missing or call fails)
+let d2 = null;
+if (!process.env.PEXELS_API_KEY) {
+  console.warn("[smoke] PEXELS_API_KEY not set → skipping slideshow-draft");
+} else {
+  try {
+    const pexels = createPexelsClient({ apiKey: process.env.PEXELS_API_KEY });
+    const ss = createSlideshowDraft({
+      router,
+      pexelsSearch: pexels.searchOne,
+      writeDraft: (id, d) => {
+        const dir = `${draftsRoot}/pending/${id}`;
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(`${dir}/draft.json`, JSON.stringify(d, null, 2));
+      },
+      writeMedia: (p, c) => writeFileSync(p, c),
+      mkdirp: (p) => mkdirSync(p, { recursive: true }),
+      now: () => new Date(),
+      draftsRoot,
+      idGenerator: () => `smoke-${new Date().toISOString().slice(0, 10)}-slideshow-${Math.random().toString(36).slice(2, 6)}`,
+    });
+    ({ draft: d2 } = await ss.run({ topic, niche: "ai" }));
+    console.log(`[smoke] slideshow draft: ${d2.id}`);
+  } catch (e) {
+    console.warn(`[smoke] slideshow-draft failed: ${e.message} → skipping`);
+  }
+}
 
-// 4. quotecard
-const renderCard = createRenderCard({
-  pythonBin: `${LIVE_WS}/.venv/bin/python3`,
-  scriptPath: `${WS}/skills/quotecard-draft/render.py`,
-});
-const qc = createQuotecardDraft({
-  router,
-  renderCard,
-  writeDraft: (id, d) => {
-    const dir = `${draftsRoot}/pending/${id}`;
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(`${dir}/draft.json`, JSON.stringify(d, null, 2));
-  },
-  mkdirp: (p) => mkdirSync(p, { recursive: true }),
-  now: () => new Date(),
-  draftsRoot,
-  idGenerator: () => `smoke-${new Date().toISOString().slice(0, 10)}-quotecard-${Math.random().toString(36).slice(2, 6)}`,
-});
-const { draft: d3 } = await qc.run({ topic, niche: "ai" });
-console.log(`[smoke] quotecard draft: ${d3.id}`);
+// 4. quotecard (Ollama-only — runs even without Pexels/Anthropic)
+let d3 = null;
+try {
+  const renderCard = createRenderCard({
+    pythonBin: `${LIVE_WS}/.venv/bin/python3`,
+    scriptPath: `${WS}/skills/quotecard-draft/render.py`,
+  });
+  const qc = createQuotecardDraft({
+    router,
+    renderCard,
+    writeDraft: (id, d) => {
+      const dir = `${draftsRoot}/pending/${id}`;
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(`${dir}/draft.json`, JSON.stringify(d, null, 2));
+    },
+    mkdirp: (p) => mkdirSync(p, { recursive: true }),
+    now: () => new Date(),
+    draftsRoot,
+    idGenerator: () => `smoke-${new Date().toISOString().slice(0, 10)}-quotecard-${Math.random().toString(36).slice(2, 6)}`,
+  });
+  ({ draft: d3 } = await qc.run({ topic, niche: "ai" }));
+  console.log(`[smoke] quotecard draft: ${d3.id}`);
+} catch (e) {
+  console.warn(`[smoke] quotecard-draft failed: ${e.message} → skipping`);
+}
 
 // 5. send for approval (skipped in sandbox)
 if (SANDBOX) {
