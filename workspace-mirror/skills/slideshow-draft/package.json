@@ -1,0 +1,9 @@
+{
+  "name": "slideshow-draft",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "scripts": { "test": "vitest run" },
+  "dependencies": { "shared": "file:../shared" },
+  "devDependencies": { "vitest": "^2.0.0" }
+}
