@@ -70,14 +70,15 @@ Each skill lives at `~/.openclaw/workspace/skills/<name>/`, mirrored to `~/Deskt
 ### 2.2 `whitelist-scan`
 
 - **Responsibility:** Poll sources.yaml for new episodes, download audio.
-- **Input:** reads `config/sources.yaml`
+- **Input:** reads `~/.openclaw/workspace/config/sources.yaml` via `shared/sources-store.js` (sole reader)
 - **Output:** new episodes → `~/openclaw-drafts/whitelist/audio-cache/<source-id>/<ep-id>.m4a` + per-source `manifest.json`
 - **How:**
-  1. For each source in sources.yaml where `lastScanned + poll_frequency_h < now`
-  2. `yt-dlp --dateafter <lastScanned> --flat-playlist <url>` → list new video IDs
-  3. For each new ID: `yt-dlp -f m4a -o <audio-cache-path> <video-id>`
-  4. Update `manifest.json` with `{episode_id, title, duration_s, published_at, audio_path}`
-  5. Mark source's `lastScanned` timestamp
+  1. **Disk-space precheck**: `statfs` free bytes on `~/openclaw-drafts/` volume; abort + DM user if < 5 GB free
+  2. For each source in sources.yaml where `lastScanned + poll_frequency_h < now`
+  3. `yt-dlp --dateafter <lastScanned> --flat-playlist <url>` → list new video IDs
+  4. For each new ID: `yt-dlp -f m4a -o <audio-cache-path> <video-id>`
+  5. Update `manifest.json` with `{episode_id, title, duration_s, published_at, audio_path}`
+  6. Mark source's `lastScanned` timestamp (written back via `sources-store.js`)
 - **CLI:** `bin/scan.js [<source-id>]` — runs all sources or one
 - **Deps:** `yt-dlp`, `shared`
 
@@ -85,30 +86,36 @@ Each skill lives at `~/.openclaw/workspace/skills/<name>/`, mirrored to `~/Deskt
 
 - **Responsibility:** Whisper.cpp large-v3 on a cached audio file.
 - **Input:** audio file path + source_id + episode_id
-- **Output:** `~/openclaw-drafts/whitelist/transcript-cache/<source>/<ep-id>.json` (Transcript schema, §3.1)
+- **Output:** `~/openclaw-drafts/whitelist/transcript-cache/<source>/<ep-id>.json` (Transcript schema, §3.1). Transcript JSON carries `segments[].{t_start, t_end, text}` which is sufficient for clip-extract to regenerate any SRT it needs — no raw SRT is retained.
 - **How:**
-  1. Shell out to `whisper-cli --model large-v3 --language en --output-srt <audio>`
-  2. Parse the generated SRT into segments
-  3. Emit Transcript JSON
-  4. Delete raw SRT (kept only as intermediate)
+  1. **Ollama unload (RAM co-tenancy)**: before invoking whisper, trigger Ollama to evict loaded models by calling `POST /api/generate` with `keep_alive: 0` against every model the router may have warm. Whisper large-v3 + qwen2.5:14b exceed 16GB if both are resident. This is an implementation detail of transcribe — callers don't need to know.
+  2. Shell out to `whisper-cli -m <model-path> -l en -osrt <audio>` using the pinned `large-v3` GGML model
+  3. Parse the generated SRT into segments, emit Transcript JSON
+  4. Delete raw SRT file (Transcript JSON is authoritative)
+  5. Return — Ollama reloads its models lazily on next router call
 - **CLI:** `bin/transcribe.js <audio-path> <source-id> <episode-id>`
-- **Deps:** `whisper-cpp` (Metal backend), `shared`
+- **Deps:** `whisper-cpp` (Metal backend), `shared`, Ollama HTTP (for unload step)
 
 ### 2.4 `clip-extract`
 
 - **Responsibility:** Turn a transcript into 1 clip Draft (with vertical MP4).
-- **Input:** transcript JSON path + source metadata (from sources.yaml)
+- **Input:** transcript JSON path + source metadata (from sources.yaml) + original audio/video path (for the source episode)
 - **Output:** `~/openclaw-drafts/pending/<draft-id>/draft.json` (mode: clip) + `media/0.mp4`
 - **How:**
   1. LLM `reason` scans transcript → returns top 3 candidates: `[{start_s, end_s, reasoning, hook_quote}]`
-  2. Orchestrator picks best-1 by score (for M2: just top of list)
-  3. FFmpeg:
-     - `-ss <start> -to <end>` — trim
-     - `-vf "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"` — vertical crop
-     - Burn captions from SRT segments in the clip range
-     - `-c:v libx264 -preset medium -crf 23 -c:a aac`
-  4. LLM `write` composes caption + hashtags using source's `attribution_template`
-  5. Write `draft.json` matching parent-spec §5 schema
+  2. For M2, keep top-1 (orchestrator will pick in M3)
+  3. **Emit clip-local SRT**: filter `transcript.segments` to those overlapping `[start_s, end_s]`, time-shift each by `-start_s` so segment 0 starts at `00:00:00,000`, write to `pending/<draft-id>/media/clip.srt`
+  4. **FFmpeg filtergraph** (real command, not pseudo):
+     ```
+     ffmpeg -ss <start_s> -to <end_s> -i <source-video-path> \
+       -vf "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,subtitles=media/clip.srt:force_style='FontName=Inter,Fontsize=28,Alignment=2,OutlineColour=&H00000000,BorderStyle=3'" \
+       -c:v libx264 -preset medium -crf 23 -c:a aac -r 30 \
+       media/0.mp4
+     ```
+     - `-ss/-to` before `-i` = fast seek; `subtitles=` filter burns ASS-styled captions from the time-shifted SRT; `BorderStyle=3` gives a solid black box behind text for readability
+  5. LLM `write` composes caption + hashtags using source's `attribution_template` (validated non-empty)
+  6. Write `draft.json` matching parent-spec §5 schema
+- **Note on source video**: `whitelist-scan` currently downloads `m4a` audio only. For clip-extract to produce a real video, scan must also cache the video stream — updated to `yt-dlp -f "bestvideo[height<=1080]+bestaudio/best" -o <video-cache-path>` OR clip-extract re-downloads on demand. Decision: **scan caches both audio-only (for transcribe) and video (for clip-extract)**; the video file is auto-pruned 7 days after first successful clip-extract. This is explicit in §2.2 manifest.json: `{audio_path, video_path, video_pruned_at}`.
 - **CLI:** `bin/extract.js <transcript-path> <source-id>`
 - **Deps:** `ffmpeg`, `provider-router`, `shared`
 
@@ -149,23 +156,33 @@ Each skill lives at `~/.openclaw/workspace/skills/<name>/`, mirrored to `~/Deskt
 - **Responsibility:** Discover clip-permitted YouTube channels, propose for user approval via Telegram.
 - **Input (push mode):** `<url>` — a YouTube channel or video URL
 - **Input (pull mode):** `<niche>` — agent searches autonomously
-- **Output:** Telegram message with candidate + [✅ Approve] [❌ Reject] [🔗 Open evidence]. On approve → `~/.openclaw/workspace/config/sources.yaml` gets a new entry. On reject → appended to `~/openclaw-drafts/logs/rejected-sources.jsonl`.
+- **Output:** Telegram message with candidate + [✅ Approve] [❌ Reject] [🔗 Open evidence]. On approve → `~/.openclaw/workspace/config/sources.yaml` gets a new entry via `shared/sources-store.js` (sole writer). On reject → appended to `~/openclaw-drafts/logs/rejected-sources.jsonl`.
 - **How:**
-  1. **Push:** fetch channel/video page via OpenClaw browser → YouTube Data API channel metadata (subs, recent views) → scan description + linked website for clip-policy keywords → LLM `extract` on any found policy page
-  2. **Pull:** YouTube Data API `/search` in niche keywords, sort by viewCount 30d → fetch channel metadata → policy check (same as push)
-  3. Score = `subs × (recent 30d views / subs)` — surfaces rising channels, not just big old ones
-  4. LLM `bulk-classify` assigns niche fit + confidence 0-1
-  5. Filter: confidence ≥ 0.7 AND license detected AND attribution template extractable
-  6. For each surviving candidate: create `~/openclaw-drafts/pending-source/<candidate-id>/state.json` → `approval.sendForApproval()` with Candidate message template
-  7. Poller-side: add callback prefix `s:` (source) to dispatcher → on approve, append to `sources.yaml` atomically; on reject, log
+  1. **Push:** fetch channel/video page via OpenClaw browser → YouTube Data API `channels.list(part=snippet,statistics)` (1 unit) → scan channel description + linked website for clip-policy keywords → LLM `extract` on any found policy page
+  2. **Pull:** YouTube Data API `search.list(q=<niche keywords>, publishedAfter=now-30d, type=channel, maxResults=25)` (100 units) to surface channels that have been publishing recently; then for each returned channel, `channels.list` (1 unit each) + optional `search.list(channelId, order=viewCount, maxResults=5)` to sample recent high-view videos (100 units each). Note: the YouTube Data API does NOT natively support sorting channels by "30-day views" — the `publishedAfter` filter is used as a proxy for "active recently"; per-channel video-list aggregation is used for velocity. Expected quota per pull run: ~1-3k units (roughly 3 niches × ~500-1000 units each). Quota safety margin: 3-6× headroom under the 10k/day default.
+  3. Score = `subs × (sum of views on last-30d uploads / subs)` — surfaces rising channels, not just big old ones. Channels with zero recent uploads score 0.
+  4. **Compliance gate (multi-step, no single-signal bypass):**
+     - **Step a — regex precheck**: the policy page's text must match at least one of the following phrasings: `/\b(clip|clipping|highlight|repost|excerpt|short)s?\b.{0,60}\b(allow|grant|permit|free|welcome|ok|fine|encouraged)/i` OR `/creative commons/i` (and if CC, it must be CC-BY or CC-BY-SA, not NC/ND). No regex match → candidate dropped.
+     - **Step b — LLM classifies**: `bulk-classify` task returns `{license_type, confidence, evidence_snippet_verbatim, niche_fit}`. The `evidence_snippet_verbatim` must be a substring of the fetched page text (we validate this programmatically — no paraphrasing allowed).
+     - **Step c — scoring threshold**: `recommendation_confidence ≥ 0.70` AND `attribution_template` non-empty AND contains `{episode_title}` OR `{episode_num}` placeholder.
+  5. **Telegram message layout** (enforces human-must-read gate): the Candidate message renders the `evidence_snippet_verbatim` INLINE (not behind a button), plus the evidence URL as a button. No auto-approve path under any confidence score — approval is always a human tap on [✅ Approve]. If LLM confidence is 1.0, it still goes through the same human gate.
+  6. For each surviving candidate: create `~/openclaw-drafts/pending-source/<candidate-id>/state.json` → `approval.sendForApproval()` with Candidate message template. Pending-source entries have NO timeout — they stay pending until user approves or rejects, matching M1's draft-pending behavior.
+  7. Poller-side callback wiring (prefix `s:`) is **NOT** built inside source-discovery. It lives in Phase 5 (§4), alongside other poller integration work. This keeps source-discovery Phase-3-parallel-safe.
 - **CLI:** `bin/discover.js --url=<url>` (push) or `bin/discover.js --niche=<n>` (pull)
 - **Deps:** YouTube Data API v3 (`YOUTUBE_API_KEY`), OpenClaw browser tool, `provider-router`, `shared`, `approval` (reuses Telegram plumbing)
 
 ### 2.8 Supporting changes to existing skills
 
-- **`shared/`** — add three schema constants: Transcript, Storyboard, Candidate (and their validators)
-- **`shared/`** — add `sources-store.js` for atomic read/write of `sources.yaml`
-- **`poller/bin/poll.js`** — wire in provider-router (currently `router = null`) so M1's modify flow can regenerate; add callback prefix dispatch for `s:` (source-discovery approvals); add `/sources` slash commands (`/sources`, `/sources propose <url>`, `/sources remove <id>`)
+**`provider-router` (pre-existing, built in Plan A — 21 tests passing on main):** Already handles Ollama + Anthropic adapters, mode/task-class routing, spend tracking, retry + fallback. M2 does NOT rebuild it; M2 skills import and call `router.complete({taskClass, prompt, ...})`.
+
+**`shared/` additions:**
+- `schemas.js` — Transcript, Storyboard, Candidate schema constants + AJV-style validators (returns `{valid: bool, errors: [...]}`)
+- `sources-store.js` — **sole reader AND writer** for `~/.openclaw/workspace/config/sources.yaml`. Uses `fs.open(..., 'wx+')` lockfile + write-to-temp + `fs.rename` for atomicity. Every caller (whitelist-scan, source-discovery approval handler, poller `/sources` commands) goes through this store — no direct YAML reads/writes anywhere else.
+
+**`poller/bin/poll.js` updates (Phase 5 — poller integration):**
+- Wire in `provider-router` (currently `router = null`) so M1's modify flow can regenerate drafts
+- Add callback prefix dispatch for `s:` (source-discovery approve/reject) → invokes `sources-store.append()` on approve, `logs/rejected-sources.jsonl` append on reject
+- Add `/sources` slash commands: `/sources` (list), `/sources propose <url>` (triggers `bin/discover.js --url=<url>`), `/sources remove <id>` (goes through `sources-store.remove()`)
 
 ### 2.9 File layout per skill
 
@@ -192,6 +209,7 @@ Pinned in `shared/schemas.js`; consumers import and validate.
   "source_id": "lex-fridman",
   "episode_id": "ABC123XYZ",
   "title": "Lex Fridman #999 — Sam Altman",
+  "language": "en",
   "duration_s": 7234,
   "transcribed_at": "2026-04-16T13:14:00Z",
   "model": "whisper-large-v3",
@@ -223,6 +241,9 @@ Pinned in `shared/schemas.js`; consumers import and validate.
 
 ### 3.3 Candidate schema (source-discovery)
 
+**Validator requirement**: `attribution_template` must be a non-empty string containing at least one of `{episode_title}`, `{episode_num}`, or `{creator}` as a literal substring. Candidates failing this validator are dropped before reaching Telegram.
+
+
 ```json
 {
   "candidate_id": "2026-04-16-cand-lex-001",
@@ -252,7 +273,7 @@ Pinned in `shared/schemas.js`; consumers import and validate.
 ```
 Phase 1 — Install externals (sequential, user-in-loop):
   ├─ brew install ffmpeg whisper-cpp yt-dlp
-  ├─ whisper-cli --download-model large-v3
+  ├─ download whisper large-v3 GGML model
   ├─ python3 -m venv ~/.openclaw/workspace/.venv && .venv/bin/pip install Pillow
   ├─ obtain YOUTUBE_API_KEY (Google Cloud Console, enable YouTube Data API v3)
   ├─ add YOUTUBE_API_KEY to ~/.openclaw/workspace/.env
@@ -260,23 +281,23 @@ Phase 1 — Install externals (sequential, user-in-loop):
 
 Phase 2 — Shared contracts (~30 min):
   ├─ shared/schemas.js (Transcript, Storyboard, Candidate + validators)
-  ├─ shared/sources-store.js (atomic read/write for sources.yaml)
+  ├─ shared/sources-store.js (atomic read/write for sources.yaml with lockfile)
   └─ update shared tests
 
 Phase 3 — Parallel independent skills (6 subagents concurrently):
   ├─ research
-  ├─ whitelist-scan
-  ├─ transcribe
+  ├─ whitelist-scan (audio AND video caching; manifest.json as in §2.2)
+  ├─ transcribe (Ollama unload + whisper + Transcript JSON)
   ├─ slideshow-draft
-  ├─ quotecard-draft (includes render.py)
-  └─ source-discovery (skill code + approval-side callback dispatch)
+  ├─ quotecard-draft (includes render.py + venv spawn)
+  └─ source-discovery (skill code only — poller-side callback lives in Phase 5)
 
 Phase 4 — Depends on Phase 3 (sequential):
-  └─ clip-extract (consumes Transcript schema from transcribe)
+  └─ clip-extract (consumes Transcript schema from transcribe + cached video)
 
 Phase 5 — Integration:
-  ├─ poller wiring: provider-router injection + /sources commands + s: callback
-  ├─ bin/smoke-run.js (dry-run)
+  ├─ poller wiring: provider-router injection + /sources commands + s: callback dispatch
+  ├─ bin/smoke-run.js (dry-run, starts at clip-extract using pre-cached audio+transcript)
   └─ e2e smoke test (real topic → 3 real drafts in pending/ → Telegram approval)
 ```
 
@@ -295,14 +316,16 @@ Phase 3 launches up to 6 subagents in one message for max concurrency. Each gets
 
 ### Wall-clock estimate
 
-| Phase | Time |
-|---|---|
-| 1. External deps | ~30 min (large-v3 download bottleneck) |
-| 2. Shared schemas | ~30 min |
-| 3. Parallel skills | ~2-3 hrs |
-| 4. clip-extract | ~1 hr |
-| 5. Integration + smoke | ~1 hr |
-| **Total active work** | **~5-6 hrs** |
+Revised after initial review found subagent coordination overhead was understated.
+
+| Phase | Time | Notes |
+|---|---|---|
+| 1. External deps | ~45 min | large-v3 model download (~3GB) is bottleneck; YouTube API key signup parallel |
+| 2. Shared schemas | ~45 min | schemas.js + sources-store.js both need tests |
+| 3. Parallel skills | ~4-5 hrs | 6 subagents × rsync + npm install + test/fix cycles; primary agent is the serialization point |
+| 4. clip-extract | ~1.5 hrs | includes SRT time-shift logic + filtergraph tuning |
+| 5. Integration + smoke | ~1.5 hrs | poller wiring + `s:` dispatch + smoke-run + e2e |
+| **Total active work** | **~8-9 hrs** | plan for two 4-hr sessions |
 
 ---
 
@@ -356,20 +379,26 @@ Every skill follows M1 conventions (reference: `shared/`, `approval/`, `poller/`
 
 ### 6.3 End-to-end (Phase 5)
 
-- `bin/smoke-run.js` runs a full chain:
+- `bin/smoke-run.js` runs a full chain. To avoid a 60-min Whisper wait, smoke-run accepts a `--cached` flag (default on in dev) that skips the scan+transcribe phases and starts at clip-extract using the pre-cached fixture (audio file AND transcript JSON, see §6.4).
+- `bin/smoke-run.js [--live]` chain:
   1. `research(ai)` → picks topic T
-  2. `whitelist-scan --source lex-fridman` (uses a pre-cached audio file to skip the 60-min transcribe wait)
-  3. `transcribe(cached-audio)` (skipped if transcript-cache hit)
-  4. `clip-extract(transcript, lex-fridman)` → Draft 1
+  2. If `--live`: `whitelist-scan --source lex-fridman` (downloads real latest Lex episode if not yet cached)
+  3. If `--live` AND no cached transcript: `transcribe(cached-audio)` (blocks ~60 min)
+  4. `clip-extract(transcript, lex-fridman, video-path)` → Draft 1
   5. `slideshow-draft(T, ai)` → Draft 2
   6. `quotecard-draft(T)` → Draft 3
   7. For each draft: `approval.sendForApproval(...)` (reused from M1)
-- Expected: 3 Telegram DMs within ~5 min of running `bin/smoke-run.js`, each with approve/modify/reject buttons that work per M1 flow
+- **State isolation**: smoke-run writes to `~/openclaw-drafts/pending/` by default (the real user root), BUT prefixes each draft_id with `smoke-` so they are visually distinct in the pending folder and easy to bulk-delete (`rm -rf ~/openclaw-drafts/pending/smoke-*`). An additional `--sandbox` flag redirects all writes to `/tmp/openclaw-smoke/` (no Telegram — just creates files) for pure offline validation.
+- Expected: `--cached` mode produces 3 Telegram DMs within ~3 min of running `bin/smoke-run.js`, each with approve/modify/reject buttons that work per M1 flow.
 
 ### 6.4 Pre-cached test assets
 
-- One Lex Fridman episode pre-transcribed and checked into `~/openclaw-drafts/whitelist/transcript-cache/lex-fridman/<fixture-id>.json` so the Phase 5 smoke run doesn't block on a real 60-minute Whisper transcribe
-- This fixture is gitignored (lives under `~/openclaw-drafts/`, not the repo)
+- One Lex Fridman episode pre-downloaded AND pre-transcribed, living at:
+  - `~/openclaw-drafts/whitelist/audio-cache/lex-fridman/<fixture-id>.m4a` (audio for reference)
+  - `~/openclaw-drafts/whitelist/video-cache/lex-fridman/<fixture-id>.mp4` (video, required by clip-extract to produce an actual clip)
+  - `~/openclaw-drafts/whitelist/transcript-cache/lex-fridman/<fixture-id>.json` (Transcript JSON)
+- Fixture paths are gitignored (under `~/openclaw-drafts/`, not the repo)
+- Creating the fixture is a one-time manual step in Phase 1: pick an episode that's interesting enough to produce a good smoke-clip, run `bin/scan.js --source lex-fridman --video` then `bin/transcribe.js <audio>` once
 
 ---
 
@@ -398,13 +427,14 @@ Every skill follows M1 conventions (reference: `shared/`, `approval/`, `poller/`
 | clip-extract | viral-moment detection on transcript | `reason` |
 | clip-extract | caption + hashtags | `write` |
 | slideshow-draft | script generation | `write` |
+| slideshow-draft | script → 6-beat split | `write` |
 | slideshow-draft | beat keyword extraction | `extract` |
 | slideshow-draft | caption + hashtags | `write` |
 | quotecard-draft | quote extraction from context | `extract` |
 | quotecard-draft | quote generation (no-context path) | `write` |
 | quotecard-draft | caption + hashtags | `write` |
 | source-discovery | niche fit classification | `bulk-classify` |
-| source-discovery | policy evidence extraction | `extract` |
+| source-discovery | policy evidence extraction (with verbatim snippet validation) | `bulk-classify` |
 
 ---
 
@@ -412,14 +442,18 @@ Every skill follows M1 conventions (reference: `shared/`, `approval/`, `poller/`
 
 | Risk | Mitigation |
 |---|---|
-| **Whisper large-v3 slow** (~60 min per 2h podcast) | Phase 5 smoke uses a pre-cached transcript so the dev loop isn't gated on a live transcribe run. In production, the 13:00 scan-whitelist cron is independent from the 09:00 daily-loop, so latency doesn't block drafts. |
+| **Whisper large-v3 slow** (~60 min per 2h podcast) | Smoke flow uses pre-cached audio+transcript so dev loop isn't blocked. In production, the 13:00 scan-whitelist cron is independent from the 09:00 daily-loop. |
+| **Whisper + Ollama RAM co-tenancy** (large-v3 needs ~10GB, qwen2.5:14b ~9-10GB; 16GB M1 can't hold both resident) | `transcribe` explicitly evicts Ollama models via `POST /api/generate` with `keep_alive:0` before invoking whisper, waits ~1s for unload, then runs whisper. After whisper exits, Ollama lazy-loads its model on next router call (~3-5s cold-start penalty, acceptable for 13:00 cron). If evict fails or RAM pressure detected via `vm_stat`, transcribe aborts + DMs the user. |
 | **OpenClaw browser tool flake** (used by research + source-discovery) | Every browser call wrapped in try/catch. `research` falls back to RSS-only if browser fails 3× consecutively. `source-discovery` pull-mode skips the candidate on browser failure; push-mode surfaces the error to the user's DM. |
-| **YouTube Data API quota exhaustion** | Default 10k units/day. `/search` = 100 units, `/channels` = 1 unit. Pull-mode uses ~300-500 units/run (weekly) — well under. Push-mode is user-initiated so unlikely to spike. Quota-exceeded errors surfaced as Telegram DM with *"YouTube API quota hit for today."* |
+| **YouTube Data API quota exhaustion** | Default 10k units/day. `search.list=100`, `channels.list=1`, per-channel video velocity sampling adds ~100 units per channel. Realistic pull-mode per run: 1-3k units (3 niches × ~500-1000 units). 3-6× headroom under quota. Source-discovery caches per-channel results for 24h to absorb retry/reruns. Quota-exceeded → DM + defer pull to next cron. |
+| **YouTube search does not support "sort by 30d views"** | Not a hidden bug: spec acknowledges native YouTube Data API sorts by lifetime viewCount only. `publishedAfter=now-30d` used as activity proxy; velocity computed client-side from per-channel video samples. |
 | **Pexels rate limit** (200 req/hour free tier) | Slideshow uses 6 req/draft; even 30 drafts/hour = 180 req, just under. Log + alert if 429 received. |
+| **Disk space on 16GB M1 laptop** | `whitelist-scan` does a free-space precheck (`statfs`) before every download; aborts + DMs user if < 5 GB free on the drafts volume. 7-day video-cache prune job (cron, deferred to M3) keeps steady-state under 10 GB. |
 | **Python subprocess fails silently** | `quotecard-draft` captures stderr + non-zero exit codes; Node throws with full Python traceback. Unit test covers the failure path. |
 | **LLM returns invalid JSON** (clip-extract, source-discovery) | Use Ollama / Anthropic structured output where supported. Validate with `shared/schemas.js`. Retry once with schema-correction prompt. If second attempt fails, log + skip. |
-| **sources.yaml write race** (two source-discovery runs concurrently) | `shared/sources-store.js` uses atomic write (write to temp → rename) + `lockfile` equivalent (pid file or fs.open `wx`). |
-| **LLM hallucinates a clip policy** in source-discovery | HITL guardrail: human always approves each candidate and is encouraged to click the Evidence URL before tapping Approve. The agent provides `license_evidence_snippet` verbatim from the source page, not paraphrased — makes it easy for user to spot fabrication. |
+| **sources.yaml write race** (source-discovery + poller `/sources remove` concurrent) | `shared/sources-store.js` is the **sole reader and writer** for sources.yaml. It uses `fs.open(..., 'wx+')` advisory lockfile + write-to-temp + `fs.rename` for atomicity. Both callers (source-discovery approval handler and poller command) go through the same module. |
+| **LLM hallucinates a clip policy** in source-discovery | Defense-in-depth:<br>(a) regex precheck on page text (§2.7 step 4a) — must match clip-permission phrasings or CC-BY/BY-SA<br>(b) `evidence_snippet_verbatim` must be a substring of fetched page (programmatic validation — blocks LLM paraphrase)<br>(c) Telegram message renders evidence snippet INLINE + evidence URL as a button; no collapsed text<br>(d) no auto-approve path under any confidence score — approval is always a human tap<br>(e) reject → source goes on permanent blocklist, won't resurface |
+| **smoke-run pollutes production pending/** | Every smoke-run draft_id is prefixed `smoke-` for visual isolation + easy bulk delete. `--sandbox` flag redirects all writes to `/tmp/openclaw-smoke/` and skips Telegram entirely. |
 
 ---
 
@@ -439,6 +473,13 @@ M2 terminates when:
 - `source-discovery` pull-mode gets a new cron: Sundays 10:00
 - `approval/` + `archive/` + `poller/` (from M1) already consume the drafts that M2 produces
 
+**M3 responsibilities that M2 explicitly leaves unsolved** (so subagents in M2 don't silently invent solutions):
+
+- **Topic↔episode matching**: `research()` returns topics (e.g., "AI agents replacing junior devs"); `clip-extract` consumes a transcript + source. The join — deciding *which* whitelisted episode best matches a given topic — is the orchestrator's job in M3. M2 skills take decoupled inputs (`clip-extract` is told which transcript to process; it does not choose).
+- **Mode selection per topic**: §3.2 of the parent spec says the orchestrator picks one of (clip|slideshow|quotecard) per topic using a deterministic "one per mode per day" rule. M2 skills do not make this decision.
+- **Cron scheduling**: M2 skills do not schedule themselves. They are CLI-invokable and programmatically-invokable; M3 wires cron.
+- **Cap enforcement**: M2 skills run when invoked. M3 enforces the "N drafts per day" cap.
+
 ---
 
 ## Approval Record
@@ -451,4 +492,20 @@ Design brainstormed 2026-04-16. User confirmed each scoping decision:
 - Research uses RSS + OpenClaw browser tool web-search — confirmed
 - Dry-run script in M2; real orchestrator stays M3 — confirmed
 
-Next step after user reviews this spec: invoke `superpowers:writing-plans` to produce the implementation plan that feeds into beads epics + tasks.
+### Review revisions (2026-04-16, post-spec)
+
+Independent technical review surfaced 3 blockers, 7 significant issues, 6 nits. All applied:
+
+- **B1** — FFmpeg filtergraph spelled out with `subtitles=` filter; clip-local time-shifted SRT explicit (§2.4)
+- **B2** — YouTube quota re-estimated to 1-3k units/run; `order=viewCount` limitation acknowledged; `publishedAfter` used as activity proxy (§2.7, §8)
+- **B3** — Compliance gate now multi-step: regex precheck → verbatim-substring validation → human-eyes evidence inline in Telegram; no auto-approve path under any confidence (§2.7 step 4, §8 defense-in-depth)
+- **S1** — Whisper+Ollama RAM co-tenancy explicit: transcribe evicts Ollama models before whisper (§2.3 step 1, §8)
+- **S2** — Disk-space precheck in whitelist-scan (§2.2 step 1)
+- **S3** — `sources-store.js` named as sole reader+writer; both source-discovery and poller `/sources` commands use it (§2.8)
+- **S4** — Wall-clock revised to 8-9 hrs; poller-side `s:` callback wiring moved from Phase 3 to Phase 5 to keep Phase 3 parallel-safe (§2.7 step 7, §4, §4 wall-clock)
+- **S5** — `provider-router` explicitly noted as pre-existing from Plan A (§2.8)
+- **S6** — Fixture is both audio+transcript; smoke-run default `--cached` starts at clip-extract; `--live` triggers full chain (§6.3, §6.4)
+- **S7** — Topic↔episode matching explicitly assigned to M3 (§9)
+- **Nits** — language field added to Transcript schema; attribution_template placeholder validator added; smoke-run state isolation via `smoke-` prefix + `--sandbox` flag; source-discovery approval has no timeout (matches M1)
+
+Next step: invoke `superpowers:writing-plans` to produce the implementation plan that feeds into beads epics + tasks.
