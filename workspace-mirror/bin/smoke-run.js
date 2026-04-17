@@ -29,8 +29,128 @@ const DRAFTS = `${HOME}/openclaw-drafts`;
 const args = process.argv.slice(2);
 const LIVE = args.includes("--live");
 const SANDBOX = args.includes("--sandbox");
+const ORCHESTRATOR = args.includes("--orchestrator");
 const draftsRoot = SANDBOX ? "/tmp/openclaw-smoke" : DRAFTS;
 mkdirSync(`${draftsRoot}/pending`, { recursive: true });
+
+if (ORCHESTRATOR) {
+  const yaml = (await import("js-yaml")).default;
+  const { readdirSync: rd } = await import("node:fs");
+  const { join: jn } = await import("node:path");
+  const { createRouter } = await import(`${WS}/skills/provider-router/router.js`);
+  const ollama = (await import(`${WS}/skills/provider-router/providers/ollama.js`)).default;
+  const anthropic = (await import(`${WS}/skills/provider-router/providers/anthropic.js`)).default;
+  const { createResearch } = await import(`${WS}/skills/research/index.js`);
+  const { createSlideshowDraft } = await import(`${WS}/skills/slideshow-draft/index.js`);
+  const { createPexelsClient } = await import(`${WS}/skills/slideshow-draft/pexels.js`);
+  const { createQuotecardDraft, createRenderCard } = await import(`${WS}/skills/quotecard-draft/index.js`);
+  const { createClipExtract } = await import(`${WS}/skills/clip-extract/index.js`);
+  const { createFfmpegRunner } = await import(`${WS}/skills/clip-extract/ffmpeg.js`);
+  const { createTelegramClient } = await import(`${WS}/skills/shared/telegram-client.js`);
+  const { createDraftStore } = await import(`${WS}/skills/shared/draft-store.js`);
+  const { createQuietQueue } = await import(`${WS}/skills/shared/quiet-queue.js`);
+  const { createLogger } = await import(`${WS}/skills/shared/jsonl-logger.js`);
+  const { runDailyLoop } = await import(`${WS}/skills/orchestrator/index.js`);
+  const { sendForApproval } = await import(`${WS}/skills/approval/approval.js`);
+
+  const router = createRouter({
+    configPath: `${LIVE_WS}/config/providers.yaml`,
+    adapters: { ollama, anthropic },
+    logPath: `${draftsRoot}/logs/router.jsonl`,
+  });
+  const quietQueue = createQuietQueue({ path: `${draftsRoot}/state/quiet-queue.jsonl` });
+  const logger = createLogger(`${draftsRoot}/logs/agent.jsonl`);
+  const draftStore = createDraftStore(draftsRoot);
+
+  const tgConfig = yaml.load(readFileSync(`${LIVE_WS}/config/telegram.yaml`, "utf8"));
+  const token = process.env[tgConfig.bot_token_env] || process.env.TG_BOT_TOKEN;
+  const chatId = tgConfig.paired_user_id;
+  const realTg = SANDBOX
+    ? { sendMessage: async () => ({ message_id: 0 }) }
+    : createTelegramClient(token);
+
+  const commonWriteDraft = (id, d) => {
+    const dir = `${draftsRoot}/pending/${id}`;
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(`${dir}/draft.json`, JSON.stringify(d, null, 2));
+  };
+  const mkdirp = (p) => mkdirSync(p, { recursive: true });
+  const now = () => new Date();
+  const idFor = (mode) => `smoke-${new Date().toISOString().slice(0, 10)}-${mode}-${Math.random().toString(36).slice(2, 6)}`;
+
+  const research = createResearch({
+    readFileSync,
+    nichesPath: `${LIVE_WS}/config/niches.yaml`,
+    browserSearch: async () => [],
+    router,
+  });
+
+  const pexels = process.env.PEXELS_API_KEY
+    ? createPexelsClient({ apiKey: process.env.PEXELS_API_KEY })
+    : null;
+  const slideshowDraft = pexels
+    ? createSlideshowDraft({
+        router, pexelsSearch: pexels.searchOne,
+        writeDraft: commonWriteDraft,
+        writeMedia: (p, c) => writeFileSync(p, c),
+        mkdirp, now, draftsRoot, idGenerator: () => idFor("slideshow"),
+      })
+    : { run: async () => { throw new Error("PEXELS_API_KEY not set"); } };
+
+  const quotecardDraft = createQuotecardDraft({
+    router,
+    renderCard: createRenderCard({
+      pythonBin: `${LIVE_WS}/.venv/bin/python3`,
+      scriptPath: `${WS}/skills/quotecard-draft/render.py`,
+    }),
+    writeDraft: commonWriteDraft, mkdirp, now, draftsRoot,
+    idGenerator: () => idFor("quotecard"),
+  });
+
+  const clipExtract = createClipExtract({
+    router,
+    runFfmpeg: createFfmpegRunner(),
+    writeDraft: commonWriteDraft,
+    writeFileSync, mkdirp, now, draftsRoot,
+    idGenerator: () => idFor("clip"),
+  });
+
+  function loadTranscripts() {
+    const root = `${draftsRoot}/whitelist/transcript-cache`;
+    if (!existsSync(root)) return [];
+    const out = [];
+    for (const s of rd(root, { withFileTypes: true })) {
+      if (!s.isDirectory()) continue;
+      for (const f of rd(jn(root, s.name))) {
+        if (!f.endsWith(".json")) continue;
+        try { out.push(JSON.parse(readFileSync(jn(root, s.name, f), "utf8"))); } catch {}
+      }
+    }
+    return out;
+  }
+
+  const approvalWrap = {
+    sendForApproval: async (id) => {
+      if (SANDBOX) { console.log(`[smoke] sandbox: would send approval for ${id}`); return {}; }
+      return sendForApproval(id, { telegramClient: realTg, draftStore, chatId });
+    },
+  };
+
+  const res = await runDailyLoop({
+    clock: new Date(),
+    providerRouter: router,
+    skills: { research, slideshowDraft, quotecardDraft, clipExtract },
+    approval: approvalWrap,
+    quietQueue,
+    logger,
+    paths: { workspace: LIVE_WS, drafts: draftsRoot },
+    transcripts: loadTranscripts(),
+    telegramClient: realTg,
+    chatId,
+  });
+  console.log(`[smoke] orchestrator result:`, JSON.stringify(res, null, 2));
+  process.exit(0);
+}
 
 console.log(`[smoke] WS=${WS}`);
 console.log(`[smoke] draftsRoot=${draftsRoot}`);
