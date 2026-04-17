@@ -1,3 +1,5 @@
+import { readdirSync, statSync, unlinkSync, existsSync, rmdirSync } from "node:fs";
+import { join } from "node:path";
 import { formatTemplateB } from "shared/constants";
 
 export async function archiveDraft(draftId, { draftStore, telegramClient }) {
@@ -15,4 +17,42 @@ export async function archiveDraft(draftId, { draftStore, telegramClient }) {
     draftStore.moveToRejected(draftId, dateStr);
   }
   // Other statuses (pending, modifying, superseded) — no-op
+}
+
+const PRUNABLE_SUBDIRS = [
+  "whitelist/audio-cache",
+  "whitelist/video-cache",
+  "whitelist/transcript-cache",
+  "pexels-cache",
+];
+
+export function pruneCache({ drafts, retainDays, now = new Date() }) {
+  const cutoff = now.getTime() - retainDays * 86400 * 1000;
+  let pruned = 0;
+
+  function walkAndPrune(dir) {
+    if (!existsSync(dir)) return;
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const p = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walkAndPrune(p);
+        try {
+          const remaining = readdirSync(p);
+          if (remaining.length === 0) rmdirSync(p);
+        } catch {}
+      } else {
+        const st = statSync(p);
+        if (st.mtimeMs < cutoff) {
+          unlinkSync(p);
+          pruned++;
+        }
+      }
+    }
+  }
+
+  for (const sub of PRUNABLE_SUBDIRS) {
+    walkAndPrune(join(drafts, sub));
+  }
+
+  return { pruned };
 }

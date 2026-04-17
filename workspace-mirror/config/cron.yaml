@@ -1,1 +1,36 @@
-jobs: []
+jobs:
+  - name: daily-loop
+    schedule: "0 9 * * *"
+    skill: orchestrator
+    args: { job: daily-loop }
+    description: "Daily content-generation loop: research -> 3 drafts -> approval"
+
+  - name: morning-flush
+    schedule: "0 8 * * *"
+    skill: orchestrator
+    args: { job: flush-quiet-queue }
+    description: "Drain overnight quiet-queue; send morning digest"
+
+  - name: scan-whitelist
+    schedule: "0 13 * * *"
+    skill: whitelist-scan
+    args: { job: all }
+    description: "Poll sources.yaml for new episodes; download + transcribe"
+
+  - name: nightly-report
+    schedule: "0 23 * * *"
+    skill: report
+    args: { job: nightly }
+    description: "End-of-day digest: produced / approved / rejected / spend"
+
+  - name: source-discovery-pull
+    schedule: "0 10 * * 0"
+    skill: orchestrator
+    args: { job: source-discovery-pull }
+    description: "Weekly candidate-channel discovery across niches"
+
+  - name: cache-prune
+    schedule: "0 4 * * 0"
+    skill: archive
+    args: { job: prune-cache, retain_days: 7 }
+    description: "Prune audio/video/transcript caches older than N days"

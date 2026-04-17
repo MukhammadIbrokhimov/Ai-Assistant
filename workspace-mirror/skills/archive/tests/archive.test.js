@@ -6,11 +6,12 @@ import {
   readFileSync,
   existsSync,
   rmSync,
+  utimesSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createDraftStore } from "shared/draft-store";
-import { archiveDraft } from "../archive.js";
+import { archiveDraft, pruneCache } from "../archive.js";
 
 let tmp, store;
 
@@ -112,5 +113,62 @@ describe("archiveDraft", () => {
     await archiveDraft("test-006", { draftStore: store, telegramClient: client });
     expect(existsSync(join(tmp, "pending", "test-006"))).toBe(true);
     expect(client.sendMessage).not.toHaveBeenCalled();
+  });
+});
+
+describe("pruneCache", () => {
+  let drafts;
+  beforeEach(() => {
+    drafts = mkdtempSync(join(tmpdir(), "pc-"));
+    const dirs = [
+      "whitelist/audio-cache/lex",
+      "whitelist/video-cache/lex",
+      "whitelist/transcript-cache/lex",
+      "pexels-cache",
+      "pending/live-draft",
+      "approved/2026-04-17/ok",
+    ];
+    for (const p of dirs) mkdirSync(join(drafts, p), { recursive: true });
+    writeFileSync(join(drafts, "whitelist/audio-cache/lex/old.m4a"), "x");
+    writeFileSync(join(drafts, "whitelist/video-cache/lex/old.mp4"), "x");
+    writeFileSync(join(drafts, "whitelist/transcript-cache/lex/old.json"), "{}");
+    writeFileSync(join(drafts, "pexels-cache/old.json"), "{}");
+    writeFileSync(join(drafts, "pending/live-draft/draft.json"), "{}");
+    writeFileSync(join(drafts, "approved/2026-04-17/ok/draft.json"), "{}");
+    const tenDaysAgo = new Date(Date.now() - 10 * 86400 * 1000);
+    for (const rel of [
+      "whitelist/audio-cache/lex/old.m4a",
+      "whitelist/video-cache/lex/old.mp4",
+      "whitelist/transcript-cache/lex/old.json",
+      "pexels-cache/old.json",
+    ]) {
+      utimesSync(join(drafts, rel), tenDaysAgo, tenDaysAgo);
+    }
+  });
+  afterEach(() => rmSync(drafts, { recursive: true, force: true }));
+
+  test("prunes files older than retain_days in allow-listed cache dirs", () => {
+    pruneCache({ drafts, retainDays: 7, now: new Date() });
+    expect(existsSync(join(drafts, "whitelist/audio-cache/lex/old.m4a"))).toBe(false);
+    expect(existsSync(join(drafts, "whitelist/video-cache/lex/old.mp4"))).toBe(false);
+    expect(existsSync(join(drafts, "whitelist/transcript-cache/lex/old.json"))).toBe(false);
+    expect(existsSync(join(drafts, "pexels-cache/old.json"))).toBe(false);
+  });
+
+  test("never touches pending/ or approved/ (not in allow-list)", () => {
+    pruneCache({ drafts, retainDays: 7, now: new Date() });
+    expect(existsSync(join(drafts, "pending/live-draft/draft.json"))).toBe(true);
+    expect(existsSync(join(drafts, "approved/2026-04-17/ok/draft.json"))).toBe(true);
+  });
+
+  test("keeps files newer than retain_days", () => {
+    writeFileSync(join(drafts, "whitelist/audio-cache/lex/fresh.m4a"), "x");
+    pruneCache({ drafts, retainDays: 7, now: new Date() });
+    expect(existsSync(join(drafts, "whitelist/audio-cache/lex/fresh.m4a"))).toBe(true);
+  });
+
+  test("returns pruned count", () => {
+    const res = pruneCache({ drafts, retainDays: 7, now: new Date() });
+    expect(res.pruned).toBe(4);
   });
 });
