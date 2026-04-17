@@ -93,3 +93,50 @@ describe("runDailyLoop — steps 1-3 + wiring", () => {
     expect(slideTopic).not.toBe(quoteTopic);
   });
 });
+
+describe("runDailyLoop — retry + failure + quiet-hours", () => {
+  it("slideshow transient fail then success → all produced", async () => {
+    const slideshowRun = vi.fn()
+      .mockRejectedValueOnce(new Error("HTTP 503"))
+      .mockResolvedValue({ draft: { id: "d-slide-2", mode: "slideshow" } });
+    const deps = makeDeps({ skills: makeSkills({
+      slideshowDraft: { run: slideshowRun },
+    })});
+    const res = await runDailyLoop(deps);
+    expect(slideshowRun).toHaveBeenCalledTimes(2);
+    expect(res.drafts.find(d => d.mode === "slideshow").ok).toBe(true);
+  });
+
+  it("slideshow hard fail (TypeError) → no retry, skipped", async () => {
+    const slideshowRun = vi.fn().mockRejectedValue(new TypeError("bad schema"));
+    const deps = makeDeps({ skills: makeSkills({
+      slideshowDraft: { run: slideshowRun },
+    })});
+    const res = await runDailyLoop(deps);
+    expect(slideshowRun).toHaveBeenCalledTimes(1);
+    expect(res.drafts.find(d => d.mode === "slideshow").ok).toBe(false);
+    expect(res.drafts.find(d => d.mode === "quotecard").ok).toBe(true);
+  });
+
+  it("quiet hours routes approvals to quietQueue", async () => {
+    const deps = makeDeps({ clock: new Date(2026, 3, 17, 2, 0) });
+    await runDailyLoop(deps);
+    expect(deps.quietQueue.append).toHaveBeenCalledTimes(2);
+    expect(deps.approval.sendForApproval).not.toHaveBeenCalled();
+  });
+
+  it("summary DM sent when a mode is skipped", async () => {
+    const deps = makeDeps();
+    await runDailyLoop(deps);
+    expect(deps.telegramClient.sendMessage).toHaveBeenCalledWith(42, expect.stringContaining("clip skipped"));
+  });
+
+  it("silent on fully successful day", async () => {
+    const transcripts = [
+      { source_id: "lex", episode_id: "ep-1", title: "AI agents replacing junior devs", transcribed_at: "2026-04-16T10:00:00Z", segments: [{ t_start: 0, t_end: 3, text: "AI agents discussion" }] },
+    ];
+    const deps = makeDeps({ transcripts });
+    await runDailyLoop(deps);
+    expect(deps.telegramClient.sendMessage).not.toHaveBeenCalled();
+  });
+});
