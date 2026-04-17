@@ -47,15 +47,39 @@ export function createSlideshowDraft(deps) {
     const hashtags = hashResp.text.split(/\s+/).filter(t => t.startsWith("#")).slice(0, 12);
 
     // Step 5: per-beat keywords + Pexels
+    // Few-shot prompt — qwen2.5:14b otherwise returns prose snippets instead
+    // of concrete visual nouns, leading to off-topic stock images.
     const beats = [];
     for (const b of beatTexts) {
       const kwResp = await router.complete({
         taskClass: "extract",
-        prompt: `Return a JSON array of 2-3 concrete visual search keywords (nouns, not adjectives) that match this sentence. Sentence: "${b.text}"`,
-        maxTokens: 100,
+        prompt: `Extract 2-3 concrete VISUAL search terms from a sentence. Each term must be a thing you could photograph: a person, object, place, or scene. Avoid adjectives, abstract nouns ("innovation", "potential"), prose fragments, and brand names. Reply with ONLY a JSON array of strings.
+
+Example 1
+Sentence: "AI agents are quietly transforming junior developer roles."
+Output: ["software engineer at desk", "computer code on screen", "modern office"]
+
+Example 2
+Sentence: "In the age of endless pixels, Gemini emerges with innovation."
+Output: ["smartphone screen", "digital art gallery", "abstract pixels"]
+
+Example 3
+Sentence: "But agents need senior engineers to guide them."
+Output: ["mentor and student", "office whiteboard meeting", "engineering team"]
+
+Now do this one.
+Sentence: "${b.text}"
+Output:`,
+        maxTokens: 120,
       });
       let keywords;
-      try { keywords = JSON.parse(kwResp.text); } catch { keywords = [b.text.split(" ").slice(0, 3).join(" ")]; }
+      try {
+        keywords = JSON.parse(kwResp.text);
+        if (!Array.isArray(keywords) || keywords.length === 0) throw new Error("empty");
+      } catch {
+        // Fallback: nouns ≥ 4 chars from the sentence (very rough heuristic)
+        keywords = b.text.match(/\b[a-z]{4,}\b/gi)?.slice(0, 3) || [b.text.slice(0, 30)];
+      }
       const photo = await pexelsSearch(keywords.join(" "));
       beats.push({
         text: b.text,
