@@ -26,6 +26,9 @@ Ship the orchestrator skill, the report skill, and the cron provisioning step so
 | **Topic dedupe: not tracked at orchestrator.** | `research` already ranks by freshness; if a topic is still top-ranked on day 2, that's a signal it's genuinely hot. Avoids a state file that needs manual invalidation when the user wants to re-post. |
 | **Cron job count: 6, not 4.** | Parent spec listed 4 (daily-loop, scan, report, cache-prune). M2 added `source-discovery-pull` (Sundays 10:00). M3 adds `morning-flush` (08:00 daily) to drain the quiet-queue. |
 | **Orchestrator is batch, not long-running.** | Each cron firing invokes `orchestrator --job=<phase>` as a fresh process; it reads state from disk, does work, exits. Matches M1/M2 skill idioms. Keeps memory discipline on a 16GB laptop and leaves scheduling fully to OpenClaw cron. |
+| **Distinct topic per mode**, not topic-repeated-across-modes. | Parent §3.2 says "drawn from the top-ranked topics" (plural). Intent: produce **one draft per mode from three distinct topics**, so the Telegram inbox isn't 3 formats of the same story. clip gets the highest-ranked topic that has a matching whitelisted episode; slideshow/quotecard then take the next unused top-ranked topics. If fewer than 3 topics are available, fewer drafts are produced — we do not duplicate. |
+| **Cron-drift auto-detection dropped from M3.** | Reviewer flagged: drift detection was in risks+tests but absent from algorithm, and the source of `scheduledTs` wasn't specified. Simpler to rely on OpenClaw cron's own run-history + the nightly report flagging missed runs. Interactive catch-up ("missed 09:00 — run now?") moved to a follow-on epic. |
+| **No separate `shared/time.js`.** | The `isInQuietHours` helper is 8 lines; co-locate with `skills/orchestrator/time.js` next to where it's used. Keeps `shared/` focused on cross-skill contracts. |
 
 ### In scope for M3
 
@@ -58,11 +61,16 @@ Ship the orchestrator skill, the report skill, and the cron provisioning step so
   - Programmatic: `import { runDailyLoop, flushQuietQueue, runSourceDiscoveryPull } from 'orchestrator'`
   - CLI: `bin/orchestrator.js --job=daily-loop|flush-quiet-queue|source-discovery-pull [--sandbox] [--dry-run]`
 - **Contract of `runDailyLoop({ clock, providerRouter, skills, approval, logger, paths })`:**
-  - `clock` — injected `Date` source (enables test-time freezing)
-  - `providerRouter` — from Plan A; used for topic↔episode match call
-  - `skills` — object `{ research, clipExtract, slideshowDraft, quotecardDraft }` (injected for DI; default is the real skill imports)
-  - `approval` — from M1; orchestrator calls `approval.sendForApproval` or queues via `quiet-queue.append`
-  - `logger` — M1/M2 JSONL logger
+  - `clock` — injected `Date` source (enables test-time freezing). Called once at step 1 to pin `today` for the entire loop (prevents midnight-rollover inconsistency).
+  - `providerRouter` — from Plan A; used for topic↔episode match call. Call shape: `router.complete({ taskClass: 'reason', prompt, ... })` (verified — see Explore review, file `provider-router/router.js:65`).
+  - `skills` — object `{ research, clipExtract, slideshowDraft, quotecardDraft, sourceDiscovery }`. Each is the **factory-created instance** the M2 skills export:
+    - `research.run(niche)` → `[{topic: string, source_url, score, niche}]` (note: no `published_at` field, and the human-readable field is `topic` — a string, not an object with `.headline`)
+    - `clipExtract.run({transcript, source, videoPath})` → `{draft, dir}` (created via `createClipExtract(deps)`)
+    - `slideshowDraft.run({topic, niche, sourceContext})` → `{draft, dir, ...}` (created via `createSlideshowDraft(deps)`)
+    - `quotecardDraft.run({topic, niche, sourceContext})` → `{draft, cardPath, dir}` (created via `createQuotecardDraft(deps)`)
+    - `sourceDiscovery.runPull(niche, {maxCandidates})` → used only by the source-discovery-pull phase
+  - `approval` — from M1; orchestrator calls `approval.sendForApproval(draftId, {telegramClient, draftStore, chatId})` (M1 signature unchanged) or queues via `quietQueue.append(...)`
+  - `logger` — a JSONL logger. **`shared/` does not currently export one** (verified). M3 adds `shared/jsonl-logger.js` (new small module, see §2.3) used by orchestrator, report, and backfilled into existing skills over time.
   - `paths` — `{ workspace, drafts }` so sandbox mode can redirect
   - Returns `{ drafts: [{mode, draft_id?, ok, reason?}], durationMs, produced: N, skipped: [...] }`
 - **Phases:**
@@ -78,18 +86,27 @@ Ship the orchestrator skill, the report skill, and the cron provisioning step so
   - CLI: `bin/report.js --job=nightly [--sandbox]`
 - **Inputs (read-only):**
   - `~/openclaw-drafts/{pending,approved,rejected}/*` — filter by `created_at ≥ now-24h`
-  - `~/openclaw-drafts/logs/router.jsonl` — filter by `ts ≥ now-24h` → spend + provider mix
+  - `~/openclaw-drafts/logs/router.jsonl` — filter by `ts ≥ now-24h` → spend + provider mix; scan for `spend_cap_hit` events
   - `~/openclaw-drafts/logs/rejections.jsonl` — filter by `ts ≥ now-24h` → top rejection reason
-- **Output:** one Telegram message, no buttons. If zero activity: one line *"Quiet day — no drafts produced."* Never silent.
+- **Output:** one Telegram message, no buttons. If zero activity: one line *"Quiet day — no drafts produced."* Never silent. If a `spend_cap_hit` event is present, adds a line `"Spend cap hit at HH:MM — downgraded to local"`.
 
-### 2.3 `shared/quiet-queue.js`
+### 2.3 `shared/quiet-queue.js` + `shared/jsonl-logger.js`
+
+**`shared/quiet-queue.js`**
 
 - **API:**
-  - `append({draft_id, created_at, mode, topic})` — opens `wx+` lockfile, writes JSONL line, closes
-  - `drain()` — read-all, rename JSONL to `.processing.jsonl` atomically, returns `[entries]`. Caller decides when to delete. On caller success → delete `.processing.jsonl`. On caller failure → caller renames back. Prevents data loss if flush-digest-send fails midway.
-  - `peek()` — read-only length/list (for report/`/status` inspection)
+  - `append({draft_id, created_at, mode, topic})` — acquires lockfile, writes JSONL line, releases
+  - `drain()` — acquires lockfile; if `.processing.jsonl` exists, treats it as an orphan from a prior crash and prepends its contents to the result; renames `quiet-queue.jsonl` → `.processing.jsonl`; releases lock and returns `[entries]`. Caller is expected to call `commitDrain()` or `putBack(entries)` when done.
+  - `commitDrain()` — deletes `.processing.jsonl` (called after successful send)
+  - `putBack(entries)` — acquires lockfile; reads any entries appended during drain, concatenates with `entries` in original order, writes to `quiet-queue.jsonl` atomically (temp + rename), deletes `.processing.jsonl`; releases lock. Preserves append-after-drain entries without losing them.
+  - `peek()` — read-only snapshot (count + entries) for status inspection. Does not acquire the lock.
 - **Storage:** `~/openclaw-drafts/state/quiet-queue.jsonl`
-- **Concurrency:** `fs.open(lockfile, 'wx+')` per spec §2.8 pattern from `sources-store.js`.
+- **Concurrency:** uses the same `fs.openSync(lockPath, 'wx')` pattern as `sources-store.js` (verified). All mutating ops (`append`, `drain`, `commitDrain`, `putBack`) serialize through the lock. Concurrent drains serialize; the second drain sees the orphan `.processing.jsonl` and recovers it.
+
+**`shared/jsonl-logger.js`** (new)
+
+- **API:** `createLogger(path)` → `{ jsonl(obj), errorjsonl(err, ctx) }`. Appends `JSON.stringify(obj) + "\n"` atomically (single `fs.appendFileSync`, OS-level atomic for append mode). No rotation (delegated to `archive --job=prune-logs` as a future epic).
+- **Why new:** M1/M2 skills log ad-hoc; centralizing is a small nice-to-have for M3. Existing skills are not migrated in M3 — they keep their current logging.
 
 ### 2.4 `scripts/install-cron.mjs`
 
@@ -97,11 +114,15 @@ Ship the orchestrator skill, the report skill, and the cron provisioning step so
 - **Invocation:** `node scripts/install-cron.mjs [--dry-run]`
 - **Behavior:**
   1. Parse `~/.openclaw/workspace/config/cron.yaml` into desired state
-  2. Invoke `openclaw cron list --json` via `execFile` (argv-array form, no shell) → parse current state
+  2. Invoke `openclaw cron list --json` via `child_process.execFile` (argv-array form, no shell) → parse current state
   3. Diff by `--name`: add missing, update changed (schedule or message), remove stale (jobs present in OpenClaw but not in yaml, only within `openclaw-managed-*` name prefix to avoid clobbering unrelated cron jobs)
   4. `--dry-run` prints the `openclaw cron add/rm/edit` invocations that would run; no process spawned
 - **Naming convention:** each job's `name:` in cron.yaml gets prefixed `openclaw-managed-` when registered with OpenClaw cron, so the install script knows which jobs it owns
-- **Safety note:** all shell-outs use Node's `child_process.execFile` with argv arrays — never a single command string through `exec`. User-controlled strings from `cron.yaml` (descriptions, messages) are passed as separate argv tokens, not string-interpolated into a shell line.
+- **Skill allow-list:** only yaml jobs with `skill ∈ {orchestrator, report, whitelist-scan, archive}` are accepted. Any other value aborts with a clear error (defense against a compromised `cron.yaml`).
+- **Absolute paths:** argv arrays use absolute paths resolved via `os.homedir()` and `which openclaw` at script start. No `~` in argv (shell-expansion wouldn't happen under `execFile` — the literal string would be passed to `openclaw`).
+- **Output-shape verification:** the script's first action is to call `openclaw cron list --json` and assert the output JSON has the expected fields (`name`, `schedule`, `message`). If fields are missing or renamed in the OpenClaw CLI, the script aborts with a clear error pointing to the CLI version mismatch. Unit tests pin the shape via fixtures.
+- **Name renames are destructive:** if a user renames a job in `cron.yaml` (e.g., `daily-loop` → `morning-loop`), the diff treats it as delete+add; OpenClaw cron's run history on the old name is lost. Documented in the script's README.
+- **Safety note:** all shell-outs use Node's `child_process.execFile` with argv arrays — never a single command string through a shell. User-controlled strings from `cron.yaml` (descriptions, messages) are passed as separate argv tokens, not string-interpolated into a shell line.
 
 ### 2.5 Supporting changes to existing code
 
@@ -117,10 +138,12 @@ skills/orchestrator/
 ├── index.js                   (exports runDailyLoop, flushQuietQueue, runSourceDiscoveryPull)
 ├── daily-loop.js              (the core; ~200 lines)
 ├── topic-episode-match.js     (hybrid matcher; ~80 lines)
+├── time.js                    (isInQuietHours — small helper co-located here)
 ├── bin/orchestrator.js        (#!/usr/bin/env node CLI; --job dispatcher)
 ├── orchestrator.test.js       (unit; DI all skills)
 ├── daily-loop.test.js
 ├── topic-episode-match.test.js
+├── time.test.js
 └── README.md
 
 skills/report/
@@ -134,10 +157,13 @@ skills/report/
 
 shared/ (additions)
 ├── quiet-queue.js
-└── quiet-queue.test.js
+├── quiet-queue.test.js
+├── jsonl-logger.js
+└── jsonl-logger.test.js
 
 scripts/
-└── install-cron.mjs
+├── install-cron.mjs
+└── install-cron.test.mjs
 ```
 
 ---
@@ -148,9 +174,10 @@ scripts/
 runDailyLoop({ clock, providerRouter, skills, approval, logger, paths }):
 
   1. LOAD STATE
+     - today = clock.now()          // pinned once; reused throughout the loop
      - providers.yaml, niches.yaml, sources.yaml, telegram.yaml
      - today_drafts_by_mode = scan(paths.drafts/{pending,approved,rejected})
-                                .filter(d => sameDay(d.created_at, clock.now()))
+                                .filter(d => sameDay(d.created_at, today))
                                 .groupBy('mode')
      - modes_needed = ['clip','slideshow','quotecard'].filter(m => !today_drafts_by_mode[m])
      - If modes_needed is empty: log 'all modes already produced today'; return clean
@@ -158,34 +185,38 @@ runDailyLoop({ clock, providerRouter, skills, approval, logger, paths }):
   2. RESEARCH
      - topics = []
      - for each niche in niches.yaml:
-         try: topics.push(...await skills.research.run(niche))
+         try: topics.push(...await skills.research.run(niche))  // returns [{topic, source_url, score, niche}]
          catch: log; continue
      - topics.sort((a,b) => b.score - a.score)
      - If topics is empty: log 'no topics today', DM optional; return clean
 
-  3. MODE SELECTION
-     - assignments = {}              // mode -> topic
-     - topics_used = new Set()
+  3. MODE SELECTION (dedupe keyed on source_url — the real research output field)
+     - assignments = {}                    // mode -> topic
+     - used_urls = new Set()
      - If 'clip' in modes_needed:
          match = await matchTopicToEpisode(topics, cached_transcripts, providerRouter)
-         if match: assignments.clip = match.topic; topics_used.add(match.topic.url)
+         if match:
+           assignments.clip = { topic: match.topic, episode: match.episode }
+           used_urls.add(match.topic.source_url)
      - For m in ['slideshow','quotecard'] ∩ modes_needed:
-         pick = topics.find(t => !topics_used.has(t.url))
-         if pick: assignments[m] = pick; topics_used.add(pick.url)
-     - (It's valid for assignments to have 0, 1, 2, or 3 entries)
+         pick = topics.find(t => !used_urls.has(t.source_url))
+         if pick:
+           assignments[m] = { topic: pick }
+           used_urls.add(pick.source_url)
+     - (It's valid for assignments to have 0, 1, 2, or 3 entries — e.g., if clip took topic rank 3
+       because topics 1–2 had no matching episode, slideshow takes topic 1 and quotecard takes topic 2.)
 
-  4. GENERATE DRAFTS (per mode, isolated try/catch)
+  4. GENERATE DRAFTS (per mode, isolated try/catch, actual M2 skill shapes)
      - results = []
-     - for (mode, topic) in assignments:
-         ctx = (mode === 'clip') ? { transcript_path, source_metadata } : { niche: topic.niche }
+     - for (mode, { topic, episode }) in assignments:
          try:
-           draft = await skills[mode].generate(topic, ctx)
+           draft = await callSkill(mode, skills, topic, episode)
            results.push({ mode, draft_id: draft.id, ok: true })
          catch err:
            if isTransient(err):
              await sleep(2000)
              try:
-               draft = await skills[mode].generate(topic, ctx)
+               draft = await callSkill(mode, skills, topic, episode)
                results.push({ mode, draft_id: draft.id, ok: true })
              catch retryErr:
                results.push({ mode, ok: false, reason: retryErr.message })
@@ -194,13 +225,27 @@ runDailyLoop({ clock, providerRouter, skills, approval, logger, paths }):
              results.push({ mode, ok: false, reason: err.message })
              logger.errorjsonl(err, { mode, phase: 'daily-loop' })
 
+     callSkill(mode, skills, topic, episode):
+       switch mode:
+         case 'clip':      return (await skills.clipExtract.run({
+                                    transcript: readTranscript(episode),
+                                    source:     readSource(episode.source_id),
+                                    videoPath:  resolveVideoPath(episode)
+                                  })).draft
+         case 'slideshow': return (await skills.slideshowDraft.run({
+                                    topic: topic.topic, niche: topic.niche
+                                  })).draft
+         case 'quotecard': return (await skills.quotecardDraft.run({
+                                    topic: topic.topic, niche: topic.niche
+                                  })).draft
+
   5. APPROVAL DISPATCH
-     - in_quiet = isInQuietHours(clock.now(), telegram.yaml.quiet_hours)
+     - in_quiet = isInQuietHours(today, telegram.yaml.quiet_hours)   // reuses pinned today
      - for r in results.filter(r => r.ok):
          if in_quiet:
-           quietQueue.append({ draft_id: r.draft_id, ... })
+           quietQueue.append({ draft_id: r.draft_id, created_at: today.toISOString(), mode: r.mode, topic: ... })
          else:
-           await approval.sendForApproval(r.draft_id)  // M1 flow
+           await approval.sendForApproval(r.draft_id, { telegramClient, draftStore, chatId })  // M1 signature
 
   6. SUMMARY
      - produced = results.filter(r => r.ok).length
@@ -211,28 +256,37 @@ runDailyLoop({ clock, providerRouter, skills, approval, logger, paths }):
      - Silent on fully-successful days
 ```
 
+**Semantics note on mode selection:** clip prioritizes "best matchable topic" over "top-ranked topic." If topic rank 1 has no matching episode in the transcript cache but rank 3 does, clip uses rank 3 and slideshow/quotecard take ranks 1 and 2. This keeps clip mode productive and lets the best-ranked topics always reach the user via some mode. If zero topics match any episode, clip is skipped and slideshow/quotecard take ranks 1 and 2.
+
 ### 3.1 Topic↔episode matching (`topic-episode-match.js`)
+
+**Contract:** iterate topics in priority order (highest score first) and return the **first topic** that has at least one confident episode match. This is intentional, not a bug — see "semantics note" in §3 above. clip mode should be productive when any topic has a match; it should not require the top-ranked topic specifically to have a match.
+
+**Inputs:**
+- `topics` — already-sorted array `[{topic: string, source_url, score, niche}, ...]` from research
+- `transcripts` — array of transcript summaries read from `~/openclaw-drafts/whitelist/transcript-cache/<source>/<ep-id>.json`. The matcher computes each `summary_snippet` lazily from `segments[0..20]`.
+- `router` — provider-router for the LLM reasoning call
 
 ```
 matchTopicToEpisode(topics, transcripts, router):
-  // transcripts = [{ source_id, episode_id, title, duration_s, transcribed_at, summary_snippet }]
-  // summary_snippet = transcript.segments.slice(0, 20).map(s => s.text).join(' ') // ~1-2 min of dialogue
-
   // Filter to last 7 days of transcripts (prioritize freshness)
   recent = transcripts.filter(t => daysSince(t.transcribed_at) <= 7)
   if recent.empty: return null
 
-  // For each topic, score top-3 candidates by Jaccard(topic_keywords, episode_title+summary keywords)
-  for topic in topics:
-    keywords_topic = tokenize(topic.headline).stem().removeStopwords()
+  for topic in topics:  // priority order, highest score first
+    keywords_topic = tokenize(topic.topic).stem().removeStopwords()
+    // `topic.topic` is the headline string; research does not export a separate `.headline` field.
+
     candidates = recent.map(ep => {
-      keywords_ep = tokenize(ep.title + ' ' + ep.summary_snippet).stem().removeStopwords()
+      summary_snippet = ep.segments.slice(0, 20).map(s => s.text).join(' ')
+      keywords_ep = tokenize(ep.title + ' ' + summary_snippet).stem().removeStopwords()
       return { ep, score: jaccard(keywords_topic, keywords_ep) }
     }).sort(byScoreDesc).slice(0, 3)
 
-    if candidates[0].score === 0: continue // nothing matches — try next topic
+    if candidates.length === 0 || candidates[0].score === 0:
+      continue   // this topic has nothing to match — try the next lower-ranked topic
 
-    // LLM reason over the 3
+    // LLM reason over the 3 (router.complete — verified signature: {taskClass, prompt, schema})
     try:
       resp = await router.complete({
         taskClass: 'reason',
@@ -242,15 +296,19 @@ matchTopicToEpisode(topics, transcripts, router):
       if resp.confidence >= 0.5:
         pick = candidates.find(c => c.ep.episode_id === resp.best_episode_id)
         if pick: return { topic, episode: pick.ep, confidence: resp.confidence, via: 'llm' }
+        // If LLM returned an episode_id not in our candidate set, fall through to keyword.
     catch:
-      // fall through to keyword top-1
+      // LLM call failed — fall through to keyword top-1
       pass
 
     // Keyword-only fallback: accept top candidate if score above threshold
     if candidates[0].score >= 0.15:
       return { topic, episode: candidates[0].ep, confidence: candidates[0].score, via: 'keyword' }
 
-  return null  // no topic matched any episode with minimum confidence
+    // This topic had candidates but none confident; try the next lower-ranked topic.
+    continue
+
+  return null  // no topic in the entire list found a confident episode match
 ```
 
 The Jaccard threshold `0.15` is tunable; it's an implementation detail, not a design constant.
@@ -268,7 +326,11 @@ isInQuietHours(now, quiet_hours):
     return local_hhmm >= quiet_hours.start && local_hhmm < quiet_hours.end
 ```
 
-Lives in `shared/time.js` (new file, ~20 lines + tests).
+Lives in `skills/orchestrator/time.js` (~20 lines + tests). Not `shared/` — it's only used by orchestrator today; move if a second consumer appears.
+
+**Boundary behavior** (pinned):
+- At exactly `22:00` → quiet (start is inclusive)
+- At exactly `08:00` → not-quiet (end is exclusive). This matters because morning-flush fires *at* 08:00 and must not see itself as quiet.
 
 ---
 
@@ -345,12 +407,16 @@ install-cron.mjs:
 
 All `runOrPrint(argv)` calls use Node's `child_process.execFile(argv[0], argv.slice(1))` — never a shell string. `--dry-run` mode prints each argv array instead of spawning.
 
-`buildSkillInvocation(skill, args)` returns an argv array like:
+`buildSkillInvocation(skill, args)` returns an argv array with **absolute paths** resolved at script start (`os.homedir()` expansion, never literal `~`):
 ```
-['node', '~/.openclaw/workspace/skills/orchestrator/bin/orchestrator.js', '--job=daily-loop']
+['/opt/homebrew/bin/node',
+ '/Users/<user>/.openclaw/workspace/skills/orchestrator/bin/orchestrator.js',
+ '--job=daily-loop']
 ```
 
-This argv is serialized as JSON into OpenClaw cron's `--message` and unpacked on trigger.
+This argv is serialized as JSON into OpenClaw cron's `--message` and unpacked on trigger. `~` would not be shell-expanded under `execFile` — using `os.homedir()` prevents the "literal tilde in path" trap.
+
+**Prerequisite verification:** Before the first real invocation, `install-cron.mjs` calls `openclaw cron list --json` and asserts the output JSON has the fields `name`, `schedule`, `message`. If the OpenClaw CLI version returns a different shape, the script aborts with a version-mismatch error. Unit-test fixtures pin the expected shape to one observed version (recorded in the test file as a comment).
 
 **Alternative invocation path (considered, rejected):** using `openclaw agent` with an LLM prompt. Rejected because the agent path adds LLM-driven indirection to something that should be deterministic batch execution.
 
@@ -359,26 +425,26 @@ This argv is serialized as JSON into OpenClaw cron's `--message` and unpacked on
 ## 5. Build Order
 
 ```
-Phase 1 — Shared (sequential, ~45 min):
-  ├─ shared/quiet-queue.js + tests (lockfile + drain semantics)
-  └─ shared/time.js + tests (isInQuietHours)
+Phase 1 — Shared + prerequisites (sequential, ~45 min):
+  ├─ Verify `openclaw cron list --json` output shape; record fixture for install-cron tests
+  ├─ shared/quiet-queue.js + tests (lockfile + drain/commit/putBack semantics)
+  └─ shared/jsonl-logger.js + tests
 
 Phase 2 — Parallel skills (2 subagents concurrently, ~2.5 hrs):
   ├─ skills/report/ (renderDigest + sendNightlyReport, pure fs+logs readers)
-  └─ skills/orchestrator/ daily-loop + topic-episode-match + CLI
+  └─ skills/orchestrator/ daily-loop + topic-episode-match + time + CLI
 
 Phase 3 — Provisioning + integration (sequential, ~1.5 hrs):
-  ├─ archive skill: add --job=prune-cache phase
+  ├─ archive skill: add --job=prune-cache phase (explicit allow-list of prunable subdirs)
   ├─ config/cron.yaml: fill in 6 jobs
-  ├─ scripts/install-cron.mjs + tests
-  ├─ approval.sendForApproval({bypassQuietHours}) extension
+  ├─ scripts/install-cron.mjs + tests (skill allow-list + output-shape check)
   └─ bin/smoke-run.js: add --orchestrator flag, route through runDailyLoop()
 
 Phase 4 — E2E validation (primary agent, ~1 hr):
   ├─ run node scripts/install-cron.mjs --dry-run; eyeball output
   ├─ run node scripts/install-cron.mjs (real); verify openclaw cron list
   ├─ manually trigger: openclaw cron run openclaw-managed-daily-loop
-  ├─ verify 3 sandbox drafts appear; no real Telegram
+  ├─ verify 2-3 sandbox drafts appear; no real Telegram
   ├─ at real scheduled time (or via --at=+1m debug cron), verify live firing
   └─ verify quiet-queue flush: seed fake quiet entries, run morning-flush
 ```
@@ -399,18 +465,21 @@ Phase 4 — E2E validation (primary agent, ~1 hr):
 
 ### 6.1 Unit tests (TDD — write first)
 
+**Test infrastructure:** all tests either use `memfs` or write to `/tmp/test-<uuid>/` and clean up in `afterEach`. No tests touch `~/openclaw-drafts/` or the real OpenClaw workspace.
+
 **`orchestrator.test.js` cases:**
-- happy path: 3 drafts produced, all sent for approval
-- early exit: all modes already produced today
+- happy path: 3 drafts produced from 3 distinct topics, all sent for approval
+- early exit: all modes already produced today (`today` snapshot reused, not re-read)
 - research empty: exits clean, no skill invocations
-- clip skipped (no matching episode): slideshow + quotecard still produced
+- clip skipped (no matching episode): slideshow takes topic rank 1, quotecard takes topic rank 2
+- clip takes topic rank 3 (only match), slideshow takes rank 1, quotecard takes rank 2 — all distinct
+- only 2 topics available: third mode is listed in `skipped` with reason `not_selected`
 - slideshow transient fail: retries, recovers → 3 drafts
 - slideshow hard fail: skipped; clip + quotecard still produced
 - all three fail: produced=0, summary DM sent
 - quiet-hours: approvals routed to quiet-queue instead of sendForApproval
-- topic dedupe across modes: no topic used twice in one loop
+- topic dedupe across modes: verifies `source_url`-based deduplication (not `url`)
 - sandbox mode: all fs writes land under `/tmp/...`
-- drift detection: clock.now() - scheduled_ts > 2h → DM sent before proceeding
 
 **`topic-episode-match.test.js`:**
 - perfect keyword match (same words) — LLM confirms → `via: 'llm'`
@@ -427,8 +496,11 @@ Phase 4 — E2E validation (primary agent, ~1 hr):
 **`quiet-queue.test.js`:**
 - append + peek + drain round-trip
 - concurrent appends (parallel `append` calls via `Promise.all`) → no lost entries
-- drain-then-crash: `.processing.jsonl` remains, recoverable on next call
-- drain-then-success: `.processing.jsonl` deleted
+- drain-then-commit: `.processing.jsonl` deleted
+- drain-then-putBack: entries restored to `quiet-queue.jsonl`, `.processing.jsonl` deleted
+- drain-then-crash: `.processing.jsonl` remains; next `drain()` recovers those entries and prepends them
+- orphan recovery after prior-run crash: fresh `drain()` sees existing `.processing.jsonl` + fresh `quiet-queue.jsonl` → returns orphan entries + current entries in that order
+- append during in-flight drain: write waits on lock, lands in `quiet-queue.jsonl` (not `.processing.jsonl`); subsequent `putBack` preserves it
 
 **`install-cron.test.js`:**
 - add missing
@@ -436,11 +508,15 @@ Phase 4 — E2E validation (primary agent, ~1 hr):
 - update on message change
 - remove stale (not in yaml but managed prefix)
 - ignore unmanaged (no `openclaw-managed-` prefix)
+- skill allow-list: reject yaml job with disallowed `skill` value
+- output-shape check: `openclaw cron list --json` returning unexpected shape → abort with clear error
 - `--dry-run` prints, no process spawned
+- all shell-outs use `execFile` with argv arrays; tests verify no argv element contains an interpolated user string
 
-**`shared/time.test.js`:**
+**`skills/orchestrator/time.test.js`:**
 - quiet hours wrapping midnight (22:00-08:00): inside at 23:30, inside at 03:00, outside at 09:00
 - quiet hours not wrapping (12:00-14:00): inside at 13:00, outside at 11:00 and 15:00
+- boundary: exactly 22:00 → quiet; exactly 08:00 → not quiet
 - timezone: `auto` resolves to system TZ via `Intl.DateTimeFormat().resolvedOptions().timeZone`
 
 ### 6.2 Integration — extended `bin/smoke-run.js`
@@ -487,11 +563,11 @@ Report skill makes zero LLM calls — it's pure fs+log aggregation.
 | Risk | Mitigation |
 |---|---|
 | **OpenClaw cron scheduler is paused / Gateway was down at trigger** | `openclaw cron runs` is inspectable; nightly report pulls run-history and flags any missed trigger in the digest. Re-running a missed job is a manual `openclaw cron run <name>` — not automated in M3 (the complexity of safe catch-up isn't worth it for a personal bot). |
-| **Cron fires while laptop was asleep** | OpenClaw's cron catch-up policy handles the trigger when the laptop wakes. Orchestrator computes drift (`now - scheduled_ts`); if >2h, DMs user before running. |
+| **Cron fires while laptop was asleep** | OpenClaw's cron catch-up policy handles the trigger when the laptop wakes. M3 does not implement interactive drift-detection (dropped from scope — see §1 deltas). Nightly report surfaces any missed fires via `openclaw cron runs`. |
 | **`install-cron.mjs` clobbers unrelated cron jobs** | Name prefix `openclaw-managed-` scopes all operations. Unmanaged jobs (user's own cron jobs) are invisible to the diff. Verified in `install-cron.test.js`. |
 | **`install-cron.mjs` run twice at once** | Not a real concern — it's a one-shot provisioning CLI, not daemonized. No locking added. |
 | **Topic↔episode LLM returns hallucinated episode_id** | `pick = candidates.find(c => c.ep.episode_id === resp.best_episode_id)` returns `undefined` if LLM picked one not in the candidate set → fall through to keyword fallback. Silent validation. |
-| **Quiet-queue corruption mid-flush** | `drain()` renames JSONL to `.processing.jsonl` atomically before returning entries. If the send fails, caller renames back via an explicit `quietQueue.putBack(entries)` API. If the caller itself crashes, `.processing.jsonl` remains on disk and is picked up on next flush (entries appear to be late but not lost). |
+| **Quiet-queue corruption mid-flush** | All mutating ops (`append`, `drain`, `commitDrain`, `putBack`) serialize through a `fs.openSync(lockfile, 'wx')` lock. `drain()` also handles orphan `.processing.jsonl` from a prior crash by prepending its contents to the returned entries. No way to lose data: append-during-drain is serialized to land in the new `quiet-queue.jsonl` and preserved by `putBack`. Crash-mid-flush leaves `.processing.jsonl`; next drain recovers it. |
 | **Daily-loop runs and produces drafts, but `/status` shows daemon not running** (user rebooted laptop between 09:00 fire and 09:05 check) | OpenClaw cron persists run history; `openclaw cron runs openclaw-managed-daily-loop` shows the successful fire. Orchestrator writes one `agent.jsonl` line per complete run. |
 | **Spend cap hit between draft 2 and draft 3** | provider-router already auto-downgrades to `local` (Plan A behavior). Orchestrator sees a normal return from the subsequent skill calls; the drafts are produced in local mode and labeled accordingly via `provider_used` field on the Draft. |
 | **Research succeeds but all draft skills fail** | Summary log records `produced=0, skipped=[3 entries]`. DM sent. Next day's loop is independent. Report nightly aggregates the failure. |
@@ -500,6 +576,11 @@ Report skill makes zero LLM calls — it's pure fs+log aggregation.
 | **Cron-yaml edit pushed without running `install-cron.mjs`** | Documented in `scripts/install-cron.mjs` README: "run this after editing cron.yaml". Could be auto-wired via a git pre-commit hook in the future, out of scope for M3. |
 | **OpenClaw CLI not on PATH for the daemon user** | `install-cron.mjs` resolves an absolute path to the `openclaw` binary via a PATH lookup at script start; errors if not found with a clear remediation message. Installed cron-job argv arrays use absolute `node` and script paths. |
 | **Shell injection via cron.yaml descriptions** | All subprocess calls use argv arrays with `child_process.execFile` — no shell interpolation. Malicious description text in cron.yaml cannot escape into a shell command because no shell is invoked. |
+| **`archive --job=prune-cache` accidentally deletes live drafts** | Prune job uses an **explicit allow-list** of prunable subdirs: `audio-cache/`, `video-cache/`, `transcript-cache/`, `pexels-cache/`. Never wildcards, never glob over `~/openclaw-drafts/`. Unit test includes a fixture with `pending/` and `approved/` alongside the caches, asserts they are untouched. |
+| **`openclaw cron list --json` output shape changes in a CLI upgrade** | `install-cron.mjs` validates the expected shape (`name`, `schedule`, `message` present) on every run; aborts with a version-mismatch error and a hint to check the CLI changelog. Test fixture documents the observed shape as of 2026-04-17. |
+| **User renames a cron job in cron.yaml** (e.g., `daily-loop` → `morning-loop`) | Diff treats as delete+add; OpenClaw run-history on the old name is lost. Documented in the install-cron README as an expected consequence. Not auto-migrated — a rename is unusual enough that silent migration would hide mistakes. |
+| **M2 research schema drift** (e.g., `source_url` field is renamed) | Orchestrator imports `shared/schemas.js` validators for the research output and fails loudly at step 2 if the shape no longer matches. Not silent dedupe breakage. |
+| **Nightly report misses spend-cap hit** | `router.jsonl` contains a `spend_cap_hit` event when provider-router auto-downgrades. Report reads this line in the 24h window and includes a `"Spend cap hit at HH:MM — downgraded to local"` line when present. |
 
 ---
 
@@ -538,9 +619,11 @@ M3 is the final MVP milestone per the parent spec's scope. After M3 ships, the r
 
 ## 11. Open Questions / Deferred
 
-- **Cron-drift safe catch-up** — should a wake-from-sleep trigger auto-rerun a missed daily-loop, or only DM and wait for `[Yes/Skip]`? Parent spec §8 says the latter. M3 keeps it simple: log the drift, DM if >2h, proceed. Interactive catch-up is a follow-on.
+- **Cron-drift detection** — dropped from M3 scope (reviewer #9). Parent spec §8 envisions an interactive `[Yes/Skip]` after a >2h sleep-induced drift. Implementing this requires either an env var set by OpenClaw cron on fire (`OPENCLAW_SCHEDULED_TS`) or a CLI flag; since the source of truth isn't verified, M3 punts. Follow-on epic.
 - **Digest deduplication** — if user manually runs `bin/report.js --job=nightly` at 22:58, then cron fires at 23:00, they get two reports. Minor annoyance; fix if it becomes a problem.
 - **Morning-flush digest layout** — current design renders one message with N `[Review →]` buttons. If N > 10, Telegram may clip / the digest may be hard to scan. Acceptable for steady state (≤3 quiet drafts/night); revisit if user reports clutter.
+- **`provider_router` spend_cap_hit log event** — report reads this event from `router.jsonl`. Need to verify at implementation time that provider-router actually emits it (Plan A spec §4.5 implies yes, but the implementation may emit it under a different event name). If the field is missing, report's spend-cap line silently omits — not a blocker.
+- **JSONL logger rollout** — `shared/jsonl-logger.js` is introduced for orchestrator + report. Existing skills retain their current logging. If logs get fragmented, a follow-on epic migrates everyone.
 
 ---
 
@@ -555,5 +638,29 @@ Design brainstormed 2026-04-17 after M2 merged to main. User confirmed each deci
 - Architecture sections (orchestrator batch, report, quiet-queue, provisioning) — confirmed
 - Daily-loop data flow — confirmed
 - Error handling + testing strategy — confirmed
+
+### Review revisions (2026-04-17, post-spec)
+
+Independent review surfaced 2 blockers, 8 significant issues, and 7 nits. All applied:
+
+- **B1** — Topic dedupe was keyed on `.url`; actual M2 research field is `.source_url`. Fixed everywhere (§3, tests).
+- **B2** — `matchTopicToEpisode` semantics clarified: returns the first topic in priority order that has a confident episode match. Not a bug; now documented explicitly (§3, §3.1).
+- **S1** — `today = clock.now()` pinned once at step 1 of daily-loop; reused throughout (§3 step 1, step 5).
+- **S2** — Quiet-queue API expanded: `commitDrain()` + `putBack()` added, lockfile semantics explicit, orphan `.processing.jsonl` recovery specified (§2.3).
+- **S3** — `openclaw cron list --json` output-shape verification added as prerequisite (§2.4, §5 Phase 1).
+- **S4** — Name-rename in cron.yaml = delete+add documented (§2.4, §8).
+- **S5** — Distinct-topic-per-mode refinement called out in §1 deltas (reconciled with parent spec's "drawn from the top-ranked topics").
+- **S6** — Cron-drift detection dropped from M3; moved to §11 open questions (§1 deltas, §11).
+- **S7** — M2 handoff "cap enforcement" is the one-per-mode-per-day rule itself (§3 step 1); no separate cap logic needed.
+- **S8** — Skill call signatures corrected from `.generate(topic, ctx)` to actual factory-created `.run({...})` per M2 code (§2.1, §3 step 4).
+- **Nits** — Inlined `shared/time.js` into `skills/orchestrator/time.js`; replaced `~` with `os.homedir()` resolution in pseudocode (§4.1); added skill allow-list to install-cron (§2.4); added archive-prune allow-list risk row (§8); added spend-cap line in nightly report (§2.2); test infrastructure explicit (§6.1); added `shared/jsonl-logger.js` since M1/M2 don't export one (§2.3, §2.1 logger field).
+
+Independent verification of M1/M2 interface assumptions (via Explore subagent) also caught:
+
+- `shared/` does not currently export a JSONL logger → M3 adds `shared/jsonl-logger.js`
+- `research.run(niche)` returns objects with `.topic` (string headline), not `.headline` — pseudocode fixed
+- `clipExtract/slideshowDraft/quotecardDraft` are factory-pattern (`createX(deps).run({...})`), not `.generate()` — contract §2.1 updated
+- `sourceDiscovery` exports `.runPull(niche, {maxCandidates})`, not `.pull(niche)` — contract §2.1 updated
+- `approval.sendForApproval` signature is `(draftId, {telegramClient, draftStore, chatId})` — §3 step 5 updated
 
 Next step: invoke `superpowers:writing-plans` to produce the implementation plan that feeds into beads epics + tasks.
