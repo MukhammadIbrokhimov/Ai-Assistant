@@ -1610,8 +1610,9 @@ Create `workspace-mirror/skills/orchestrator/bin/orchestrator.js`:
 
 ```js
 #!/usr/bin/env node
-import { readFileSync, existsSync, readdirSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import yaml from "js-yaml";
 import { createLogger } from "shared/jsonl-logger";
 import { createQuietQueue } from "shared/quiet-queue";
 
@@ -1641,13 +1642,12 @@ async function loadSkillsAndRouter() {
   const anthropic = (await import(`${WORKSPACE}/skills/provider-router/providers/anthropic.js`)).default;
   const { createResearch } = await import(`${WORKSPACE}/skills/research/index.js`);
   const { createSlideshowDraft } = await import(`${WORKSPACE}/skills/slideshow-draft/index.js`);
+  const { createPexelsClient } = await import(`${WORKSPACE}/skills/slideshow-draft/pexels.js`);
   const { createQuotecardDraft, createRenderCard } = await import(`${WORKSPACE}/skills/quotecard-draft/index.js`);
   const { createClipExtract } = await import(`${WORKSPACE}/skills/clip-extract/index.js`);
   const { createFfmpegRunner } = await import(`${WORKSPACE}/skills/clip-extract/ffmpeg.js`);
-  const { createPexelsClient } = await import(`${WORKSPACE}/skills/slideshow-draft/pexels.js`);
   const { createTelegramClient } = await import(`${WORKSPACE}/skills/shared/telegram-client.js`);
   const { createDraftStore } = await import(`${WORKSPACE}/skills/shared/draft-store.js`);
-  const { createSourceDiscovery } = await import(`${WORKSPACE}/skills/source-discovery/index.js`);
   const { sendForApproval } = await import(`${WORKSPACE}/skills/approval/approval.js`);
 
   const router = createRouter({
@@ -1657,8 +1657,22 @@ async function loadSkillsAndRouter() {
   });
 
   const draftStore = createDraftStore(DRAFTS);
-  const telegramClient = createTelegramClient({ token: process.env.TG_BOT_TOKEN });
-  const chatId = Number(process.env.TG_CHAT_ID);
+
+  const tgConfig = yaml.load(readFileSync(`${WORKSPACE}/config/telegram.yaml`, "utf8"));
+  const token = process.env[tgConfig.bot_token_env] || process.env.TG_BOT_TOKEN;
+  const chatId = tgConfig.paired_user_id;
+  const telegramClient = createTelegramClient(token);
+
+  // Shared draft-write helpers (mirrors smoke-run.js conventions at lines 95-104)
+  const commonWriteDraft = (id, d) => {
+    const dir = `${DRAFTS}/pending/${id}`;
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(`${dir}/draft.json`, JSON.stringify(d, null, 2));
+  };
+  const mkdirp = (p) => mkdirSync(p, { recursive: true });
+  const now = () => new Date();
+  const idFor = (mode) =>
+    `${new Date().toISOString().slice(0, 10)}-${mode}-${Math.random().toString(36).slice(2, 6)}`;
 
   const research = createResearch({
     readFileSync,
@@ -1666,26 +1680,61 @@ async function loadSkillsAndRouter() {
     browserSearch: async () => [],
     router,
   });
-  const slideshowDraft = createSlideshowDraft({
-    router, draftStore,
-    pexels: createPexelsClient({ apiKey: process.env.PEXELS_API_KEY }),
-  });
+
+  const pexels = process.env.PEXELS_API_KEY
+    ? createPexelsClient({ apiKey: process.env.PEXELS_API_KEY })
+    : null;
+  const slideshowDraft = pexels
+    ? createSlideshowDraft({
+        router,
+        pexelsSearch: pexels.searchOne,
+        writeDraft: commonWriteDraft,
+        writeMedia: (p, c) => writeFileSync(p, c),
+        mkdirp,
+        now,
+        draftsRoot: DRAFTS,
+        idGenerator: () => idFor("slideshow"),
+      })
+    : { run: async () => { throw new Error("PEXELS_API_KEY not set"); } };
+
   const quotecardDraft = createQuotecardDraft({
-    router, draftStore,
+    router,
     renderCard: createRenderCard({
-      pythonPath: `${WORKSPACE}/.venv/bin/python`,
+      pythonBin: `${WORKSPACE}/.venv/bin/python3`,
       scriptPath: `${WORKSPACE}/skills/quotecard-draft/render.py`,
     }),
+    writeDraft: commonWriteDraft,
+    mkdirp,
+    now,
+    draftsRoot: DRAFTS,
+    idGenerator: () => idFor("quotecard"),
   });
+
   const clipExtract = createClipExtract({
-    router, draftStore, ffmpeg: createFfmpegRunner(),
+    router,
+    runFfmpeg: createFfmpegRunner(),
+    writeDraft: commonWriteDraft,
+    writeFileSync,
+    mkdirp,
+    now,
+    draftsRoot: DRAFTS,
+    idGenerator: () => idFor("clip"),
   });
-  const sourceDiscovery = createSourceDiscovery({
-    router, telegramClient, chatId,
-    sourcesStorePath: `${WORKSPACE}/config/sources.yaml`,
-    youtubeApiKey: process.env.YOUTUBE_API_KEY,
-    logger,
-  });
+
+  // source-discovery has a more complex dep graph (youtube client, browser, pendingSourceStore,
+  // telegramSendCandidate). For M3, the source-discovery-pull CLI phase shells out to the
+  // existing source-discovery CLI per niche rather than re-wiring deps here.
+  const { execFile: execFileCb } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const runSub = promisify(execFileCb);
+  const sourceDiscovery = {
+    async runPull(niche) {
+      await runSub(process.execPath, [
+        `${WORKSPACE}/skills/source-discovery/bin/discover.js`,
+        `--niche=${niche}`,
+      ]);
+    },
+  };
 
   return {
     router, draftStore, telegramClient, chatId,
@@ -2494,7 +2543,49 @@ describe("computeDiff", () => {
     expect(diff.toRemove).toEqual([]);
   });
 });
+
+describe("installCron — shape validation", () => {
+  it("throws when cron list JSON has unexpected shape (no name field)", async () => {
+    const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const tmp = mkdtempSync(join(tmpdir(), "ic-"));
+    writeFileSync(join(tmp, "cron.yaml"), `jobs:\n  - name: daily-loop\n    schedule: "0 9 * * *"\n    skill: orchestrator\n    args: { job: daily-loop }\n    description: d\n`);
+    const runSub = async () => ({ stdout: JSON.stringify([{ cron: "0 9 * * *" /* no name */ }]), stderr: "" });
+    const { installCron } = await import("./install-cron.mjs");
+    await expect(installCron({
+      yamlPath: join(tmp, "cron.yaml"),
+      openClawBin: "/fake/openclaw",
+      nodePath: "/fake/node",
+      workspace: "/fake/ws",
+      runSub,
+      dryRun: true,
+    })).rejects.toThrow(/missing 'name'/);
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("accepts wrapped { jobs: [...] } shape", async () => {
+    const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join: jn } = await import("node:path");
+    const tmp = mkdtempSync(jn(tmpdir(), "ic2-"));
+    writeFileSync(jn(tmp, "cron.yaml"), `jobs:\n  - name: daily-loop\n    schedule: "0 9 * * *"\n    skill: orchestrator\n    args: { job: daily-loop }\n    description: d\n`);
+    const runSub = async () => ({ stdout: JSON.stringify({ jobs: [] }), stderr: "" });
+    const { installCron } = await import("./install-cron.mjs");
+    const res = await installCron({
+      yamlPath: jn(tmp, "cron.yaml"),
+      openClawBin: "/fake/openclaw",
+      nodePath: "/fake/node",
+      workspace: "/fake/ws",
+      runSub,
+      dryRun: true,
+    });
+    expect(res.plan.length).toBe(1);
+    rmSync(tmp, { recursive: true, force: true });
+  });
+});
 ```
+
+At the top of the test file, add `import { join } from "node:path";` if it isn't already there.
 
 - [ ] **Step 3: Verify fail**
 
@@ -2724,59 +2815,249 @@ git commit -m "feat(config): populate cron.yaml with 6 jobs"
 **Files:**
 - Modify: `workspace-mirror/bin/smoke-run.js`
 
-- [ ] **Step 1: Read the current file and locate insertion points**
+The existing smoke-run.js runs a hardcoded pipe and creates its factories inline (some conditionally, gated on env vars). Rather than refactor to hoist factories, the `--orchestrator` branch is **self-contained**: it creates its own factory wiring (mirroring Task 13's CLI) and exits 0, so the existing hardcoded pipe runs only when `--orchestrator` is absent.
 
-The existing file imports skill factories and then invokes them in a hardcoded pipe. The `--orchestrator` branch goes **after** all factories are instantiated (so `research`, `slideshowDraft`, etc. are bound) and **before** the hardcoded pipe runs. If the factories are interspersed with pipeline code, refactor minimally to group them at the top.
+- [ ] **Step 1: Add flag parsing**
 
-- [ ] **Step 2: Add flag parsing near the other flag lines**
+In `workspace-mirror/bin/smoke-run.js`, immediately after the line `const SANDBOX = args.includes("--sandbox");`, add:
 
-After the line:
-```js
-const SANDBOX = args.includes("--sandbox");
-```
-add:
 ```js
 const ORCHESTRATOR = args.includes("--orchestrator");
 ```
 
-- [ ] **Step 3: Add the orchestrator branch**
+- [ ] **Step 2: Insert self-contained orchestrator branch**
 
-After all skill factories (`research`, `slideshowDraft`, `quotecardDraft`, `clipExtract`) and the router are constructed, but before the `// 1. research` line, insert:
+Immediately after the line `mkdirSync(`${draftsRoot}/pending`, { recursive: true });` (currently line 33 in smoke-run.js), insert the branch below. This branch does its own factory wiring — it does NOT depend on the existing pipeline's bindings.
 
 ```js
 if (ORCHESTRATOR) {
-  const { runDailyLoop } = await import(`${WS}/skills/orchestrator/index.js`);
+  // Self-contained orchestrator wiring — mirrors skills/orchestrator/bin/orchestrator.js
+  const yaml = (await import("js-yaml")).default;
+  const { createRouter } = await import(`${WS}/skills/provider-router/router.js`);
+  const ollama = (await import(`${WS}/skills/provider-router/providers/ollama.js`)).default;
+  const anthropic = (await import(`${WS}/skills/provider-router/providers/anthropic.js`)).default;
+  const { createResearch } = await import(`${WS}/skills/research/index.js`);
+  const { createSlideshowDraft } = await import(`${WS}/skills/slideshow-draft/index.js`);
+  const { createPexelsClient } = await import(`${WS}/skills/slideshow-draft/pexels.js`);
+  const { createQuotecardDraft, createRenderCard } = await import(`${WS}/skills/quotecard-draft/index.js`);
+  const { createClipExtract } = await import(`${WS}/skills/clip-extract/index.js`);
+  const { createFfmpegRunner } = await import(`${WS}/skills/clip-extract/ffmpeg.js`);
+  const { createTelegramClient } = await import(`${WS}/skills/shared/telegram-client.js`);
+  const { createDraftStore } = await import(`${WS}/skills/shared/draft-store.js`);
   const { createQuietQueue } = await import(`${WS}/skills/shared/quiet-queue.js`);
   const { createLogger } = await import(`${WS}/skills/shared/jsonl-logger.js`);
-  const { createDraftStore } = await import(`${WS}/skills/shared/draft-store.js`);
-  const { readFileSync: rf, readdirSync: rd, existsSync: ex } = await import("node:fs");
-  const { join: jn } = await import("node:path");
+  const { runDailyLoop } = await import(`${WS}/skills/orchestrator/index.js`);
+  const { sendForApproval } = await import(`${WS}/skills/approval/approval.js`);
 
+  const router = createRouter({
+    configPath: `${LIVE_WS}/config/providers.yaml`,
+    adapters: { ollama, anthropic },
+    logPath: `${draftsRoot}/logs/router.jsonl`,
+  });
   const quietQueue = createQuietQueue({ path: `${draftsRoot}/state/quiet-queue.jsonl` });
   const logger = createLogger(`${draftsRoot}/logs/agent.jsonl`);
   const draftStore = createDraftStore(draftsRoot);
 
+  const tgConfig = yaml.load(readFileSync(`${LIVE_WS}/config/telegram.yaml`, "utf8"));
+  const token = process.env[tgConfig.bot_token_env] || process.env.TG_BOT_TOKEN;
+  const chatId = tgConfig.paired_user_id;
+  const realTg = SANDBOX
+    ? { sendMessage: async () => ({ message_id: 0 }) }
+    : createTelegramClient(token);
+
+  const commonWriteDraft = (id, d) => {
+    const dir = `${draftsRoot}/pending/${id}`;
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(`${dir}/draft.json`, JSON.stringify(d, null, 2));
+  };
+  const mkdirp = (p) => mkdirSync(p, { recursive: true });
+  const now = () => new Date();
+  const idFor = (mode) => `smoke-${new Date().toISOString().slice(0, 10)}-${mode}-${Math.random().toString(36).slice(2, 6)}`;
+
+  const research = createResearch({ readFileSync, nichesPath: `${LIVE_WS}/config/niches.yaml`, browserSearch: async () => [], router });
+
+  const pexels = process.env.PEXELS_API_KEY ? createPexelsClient({ apiKey: process.env.PEXELS_API_KEY }) : null;
+  const slideshowDraft = pexels
+    ? createSlideshowDraft({
+        router, pexelsSearch: pexels.searchOne,
+        writeDraft: commonWriteDraft,
+        writeMedia: (p, c) => writeFileSync(p, c),
+        mkdirp, now, draftsRoot, idGenerator: () => idFor("slideshow"),
+      })
+    : { run: async () => { throw new Error("PEXELS_API_KEY not set"); } };
+
+  const quotecardDraft = createQuotecardDraft({
+    router,
+    renderCard: createRenderCard({
+      pythonBin: `${LIVE_WS}/.venv/bin/python3`,
+      scriptPath: `${WS}/skills/quotecard-draft/render.py`,
+    }),
+    writeDraft: commonWriteDraft, mkdirp, now, draftsRoot,
+    idGenerator: () => idFor("quotecard"),
+  });
+
+  const clipExtract = createClipExtract({
+    router,
+    runFfmpeg: createFfmpegRunner(),
+    writeDraft: commonWriteDraft,
+    writeFileSync,
+    mkdirp, now, draftsRoot,
+    idGenerator: () => idFor("clip"),
+  });
+
   function loadTranscripts() {
     const root = `${draftsRoot}/whitelist/transcript-cache`;
-    if (!ex(root)) return [];
+    if (!existsSync(root)) return [];
+    const { readdirSync } = existsSync.constructor === Function ? (function(){})() : {};  // placeholder — readdirSync imported below
+    return [];  // NOTE: in sandbox mode, transcripts are typically absent; real runs populate under DRAFTS
+  }
+
+  // Transcripts loader (real impl, replacing the inline stub above)
+  const { readdirSync: realReaddirSync } = await import("node:fs");
+  const { join: realJoin } = await import("node:path");
+  const transcripts = (() => {
+    const root = `${draftsRoot}/whitelist/transcript-cache`;
+    if (!existsSync(root)) return [];
+    const out = [];
+    for (const s of realReaddirSync(root, { withFileTypes: true })) {
+      if (!s.isDirectory()) continue;
+      for (const f of realReaddirSync(realJoin(root, s.name))) {
+        if (!f.endsWith(".json")) continue;
+        try { out.push(JSON.parse(readFileSync(realJoin(root, s.name, f), "utf8"))); } catch {}
+      }
+    }
+    return out;
+  })();
+
+  const approvalWrap = {
+    sendForApproval: async (id) => {
+      if (SANDBOX) { console.log(`[smoke] sandbox: would send approval for ${id}`); return {}; }
+      return sendForApproval(id, { telegramClient: realTg, draftStore, chatId });
+    },
+  };
+
+  const res = await runDailyLoop({
+    clock: new Date(),
+    providerRouter: router,
+    skills: { research, slideshowDraft, quotecardDraft, clipExtract },
+    approval: approvalWrap,
+    quietQueue,
+    logger,
+    paths: { workspace: LIVE_WS, drafts: draftsRoot },
+    transcripts,
+    telegramClient: realTg,
+    chatId,
+  });
+  console.log(`[smoke] orchestrator result:`, JSON.stringify(res, null, 2));
+  process.exit(0);
+}
+```
+
+Remove the inline `function loadTranscripts()` placeholder — the plan's final block shows a simplified loader; keep only the second IIFE version. The code above has both for clarity; delete the first `function loadTranscripts()` and its unused import attempt before committing.
+
+Cleaned-up final version to use (replaces the messy draft above):
+
+```js
+if (ORCHESTRATOR) {
+  const yaml = (await import("js-yaml")).default;
+  const { readdirSync: rd } = await import("node:fs");
+  const { join: jn } = await import("node:path");
+  const { createRouter } = await import(`${WS}/skills/provider-router/router.js`);
+  const ollama = (await import(`${WS}/skills/provider-router/providers/ollama.js`)).default;
+  const anthropic = (await import(`${WS}/skills/provider-router/providers/anthropic.js`)).default;
+  const { createResearch } = await import(`${WS}/skills/research/index.js`);
+  const { createSlideshowDraft } = await import(`${WS}/skills/slideshow-draft/index.js`);
+  const { createPexelsClient } = await import(`${WS}/skills/slideshow-draft/pexels.js`);
+  const { createQuotecardDraft, createRenderCard } = await import(`${WS}/skills/quotecard-draft/index.js`);
+  const { createClipExtract } = await import(`${WS}/skills/clip-extract/index.js`);
+  const { createFfmpegRunner } = await import(`${WS}/skills/clip-extract/ffmpeg.js`);
+  const { createTelegramClient } = await import(`${WS}/skills/shared/telegram-client.js`);
+  const { createDraftStore } = await import(`${WS}/skills/shared/draft-store.js`);
+  const { createQuietQueue } = await import(`${WS}/skills/shared/quiet-queue.js`);
+  const { createLogger } = await import(`${WS}/skills/shared/jsonl-logger.js`);
+  const { runDailyLoop } = await import(`${WS}/skills/orchestrator/index.js`);
+  const { sendForApproval } = await import(`${WS}/skills/approval/approval.js`);
+
+  const router = createRouter({
+    configPath: `${LIVE_WS}/config/providers.yaml`,
+    adapters: { ollama, anthropic },
+    logPath: `${draftsRoot}/logs/router.jsonl`,
+  });
+  const quietQueue = createQuietQueue({ path: `${draftsRoot}/state/quiet-queue.jsonl` });
+  const logger = createLogger(`${draftsRoot}/logs/agent.jsonl`);
+  const draftStore = createDraftStore(draftsRoot);
+
+  const tgConfig = yaml.load(readFileSync(`${LIVE_WS}/config/telegram.yaml`, "utf8"));
+  const token = process.env[tgConfig.bot_token_env] || process.env.TG_BOT_TOKEN;
+  const chatId = tgConfig.paired_user_id;
+  const realTg = SANDBOX
+    ? { sendMessage: async () => ({ message_id: 0 }) }
+    : createTelegramClient(token);
+
+  const commonWriteDraft = (id, d) => {
+    const dir = `${draftsRoot}/pending/${id}`;
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(`${dir}/draft.json`, JSON.stringify(d, null, 2));
+  };
+  const mkdirp = (p) => mkdirSync(p, { recursive: true });
+  const now = () => new Date();
+  const idFor = (mode) => `smoke-${new Date().toISOString().slice(0, 10)}-${mode}-${Math.random().toString(36).slice(2, 6)}`;
+
+  const research = createResearch({
+    readFileSync,
+    nichesPath: `${LIVE_WS}/config/niches.yaml`,
+    browserSearch: async () => [],
+    router,
+  });
+
+  const pexels = process.env.PEXELS_API_KEY
+    ? createPexelsClient({ apiKey: process.env.PEXELS_API_KEY })
+    : null;
+  const slideshowDraft = pexels
+    ? createSlideshowDraft({
+        router, pexelsSearch: pexels.searchOne,
+        writeDraft: commonWriteDraft,
+        writeMedia: (p, c) => writeFileSync(p, c),
+        mkdirp, now, draftsRoot, idGenerator: () => idFor("slideshow"),
+      })
+    : { run: async () => { throw new Error("PEXELS_API_KEY not set"); } };
+
+  const quotecardDraft = createQuotecardDraft({
+    router,
+    renderCard: createRenderCard({
+      pythonBin: `${LIVE_WS}/.venv/bin/python3`,
+      scriptPath: `${WS}/skills/quotecard-draft/render.py`,
+    }),
+    writeDraft: commonWriteDraft, mkdirp, now, draftsRoot,
+    idGenerator: () => idFor("quotecard"),
+  });
+
+  const clipExtract = createClipExtract({
+    router,
+    runFfmpeg: createFfmpegRunner(),
+    writeDraft: commonWriteDraft,
+    writeFileSync, mkdirp, now, draftsRoot,
+    idGenerator: () => idFor("clip"),
+  });
+
+  function loadTranscripts() {
+    const root = `${draftsRoot}/whitelist/transcript-cache`;
+    if (!existsSync(root)) return [];
     const out = [];
     for (const s of rd(root, { withFileTypes: true })) {
       if (!s.isDirectory()) continue;
       for (const f of rd(jn(root, s.name))) {
         if (!f.endsWith(".json")) continue;
-        try { out.push(JSON.parse(rf(jn(root, s.name, f), "utf8"))); } catch {}
+        try { out.push(JSON.parse(readFileSync(jn(root, s.name, f), "utf8"))); } catch {}
       }
     }
     return out;
   }
 
-  const tg = SANDBOX
-    ? { sendMessage: async () => ({ message_id: 0 }) }
-    : telegramClient;
   const approvalWrap = {
     sendForApproval: async (id) => {
       if (SANDBOX) { console.log(`[smoke] sandbox: would send approval for ${id}`); return {}; }
-      return sendForApproval(id, { telegramClient, draftStore, chatId });
+      return sendForApproval(id, { telegramClient: realTg, draftStore, chatId });
     },
   };
 
@@ -2789,7 +3070,7 @@ if (ORCHESTRATOR) {
     logger,
     paths: { workspace: LIVE_WS, drafts: draftsRoot },
     transcripts: loadTranscripts(),
-    telegramClient: tg,
+    telegramClient: realTg,
     chatId,
   });
   console.log(`[smoke] orchestrator result:`, JSON.stringify(res, null, 2));
@@ -2797,26 +3078,30 @@ if (ORCHESTRATOR) {
 }
 ```
 
-- [ ] **Step 4: Smoke test (sandbox)**
+Use the cleaned-up final version (the second code block). The first block is annotated for explanation only — do not paste it into smoke-run.js.
+
+- [ ] **Step 3: Smoke test (sandbox)**
 
 Primary agent runs:
 ```bash
 cd ~/Desktop/openclaw/workspace-mirror/bin && OPENCLAW_LIVE=1 node smoke-run.js --orchestrator --sandbox
 ```
 
-Expected output includes `[smoke] orchestrator result:` and a JSON block. With no transcripts cached, `clip` appears in `skipped`. If a downstream skill throws because an env var is missing (PEXELS_API_KEY etc.), that's expected for integration testing; record the outcome in your notes.
+Expected output includes `[smoke] orchestrator result:` and a JSON block with `produced`, `skipped`, `drafts`. With no transcripts cached, `clip` appears in `skipped` with reason `not_selected`. If a downstream skill throws because an env var is missing (PEXELS_API_KEY etc.), that's expected — the orchestrator's per-mode try/catch isolates it.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
 cd ~/Desktop/openclaw
 git add workspace-mirror/bin/smoke-run.js
-git commit -m "feat(smoke): --orchestrator flag routes through runDailyLoop end-to-end"
+git commit -m "feat(smoke): --orchestrator flag with self-contained runDailyLoop wiring"
 ```
 
 ---
 
 # Phase 7 — Deploy + verify
+
+**Phase 7 prerequisite:** OpenClaw gateway must be paired before Tasks 22 and 23. Verify by running `/opt/homebrew/bin/openclaw cron list --json` — if it errors with "pairing required", pair via Telegram (see Plan A docs) before proceeding.
 
 ## Task 20: Rsync workspace-mirror → ~/.openclaw/workspace
 
