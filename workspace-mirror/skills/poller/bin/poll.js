@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import yaml from "js-yaml";
 import { createTelegramClient } from "shared/telegram-client";
 import { createDraftStore } from "shared/draft-store";
+import { createSourcesStore } from "shared/sources-store";
 import { createPollLoop } from "../poller.js";
+import { createSourceCallbackHandler } from "../source-callback.js";
 import { archiveDraft } from "archive/archive.js";
 import { sendForApproval } from "approval/approval.js";
 import { createModeCommand } from "../commands/mode.js";
@@ -14,8 +16,12 @@ import { createStatusCommand } from "../commands/status.js";
 import { createQueueCommand } from "../commands/queue.js";
 import { createSpendCommand } from "../commands/spend.js";
 import { createWhoamiCommand } from "../commands/whoami.js";
+import { createSourcesCommand } from "../commands/sources.js";
 import { helpCommand } from "../commands/help.js";
 import { createCancelCommand } from "../commands/cancel.js";
+import { createRouter } from "../../provider-router/router.js";
+import ollamaAdapter from "../../provider-router/providers/ollama.js";
+import anthropicAdapter from "../../provider-router/providers/anthropic.js";
 
 // Paths
 const workspacePath = join(homedir(), ".openclaw", "workspace");
@@ -50,6 +56,38 @@ if (!pairedUserId) {
 // Initialize
 const telegramClient = createTelegramClient(token);
 const draftStore = createDraftStore(draftsPath);
+const sourcesStore = createSourcesStore({ path: join(configDir, "sources.yaml") });
+
+// Wire provider-router (M2) — modify flow now works end-to-end
+const router = createRouter({
+  configPath: providersPath,
+  adapters: { ollama: ollamaAdapter, anthropic: anthropicAdapter },
+  logPath: join(draftsPath, "logs", "router.jsonl"),
+});
+
+// Source-discovery callback handler (s: prefix)
+const pendingSourceRoot = join(draftsPath, "pending-source");
+const sourceCb = createSourceCallbackHandler({
+  sourcesStore,
+  readPendingSource: (id) => {
+    const p = join(pendingSourceRoot, id, "state.json");
+    return existsSync(p) ? JSON.parse(readFileSync(p, "utf8")) : null;
+  },
+  appendRejectedLog: (entry) => {
+    const logsDir = join(draftsPath, "logs");
+    mkdirSync(logsDir, { recursive: true });
+    appendFileSync(join(logsDir, "rejected-sources.jsonl"), JSON.stringify(entry) + "\n");
+  },
+  editMessage: ({ chatId, messageId, text }) =>
+    telegramClient.editMessageText(chatId, messageId, text),
+  movePendingToArchive: (id, bucket) => {
+    const src = join(pendingSourceRoot, id);
+    if (!existsSync(src)) return;
+    const destBase = join(draftsPath, `${bucket}-source`);
+    mkdirSync(destBase, { recursive: true });
+    renameSync(src, join(destBase, id));
+  },
+});
 
 // Build command map
 const commands = {
@@ -59,12 +97,9 @@ const commands = {
   spend: createSpendCommand(routerLogPath, providersPath),
   cancel: createCancelCommand(draftStore),
   whoami: createWhoamiCommand(pairedUserId),
+  sources: createSourcesCommand(sourcesStore),
   help: helpCommand,
 };
-
-// Router not wired for M1 — modify flow will error if triggered without it
-// Will be connected when provider-router is integrated
-const router = null;
 
 const approval = { sendForApproval };
 const archive = { archiveDraft };
@@ -77,6 +112,7 @@ const loop = createPollLoop({
   router,
   pairedUserId,
   commands,
+  sourceCb,
 });
 
 // Graceful shutdown

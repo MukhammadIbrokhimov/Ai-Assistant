@@ -18,7 +18,18 @@ function parseCallbackData(data) {
   return null;
 }
 
-export async function handleCallback(cbq, { telegramClient, draftStore, archive }) {
+export async function handleCallback(cbq, { telegramClient, draftStore, archive, sourceCb }) {
+  // s: prefix is source-discovery callbacks (separate handler).
+  if (sourceCb && cbq.data.startsWith("s:")) {
+    await telegramClient.answerCallbackQuery(cbq.id, "");
+    await sourceCb.handle({
+      data: cbq.data,
+      messageId: cbq.message.message_id,
+      chatId: cbq.message.chat.id,
+    });
+    return;
+  }
+
   const parsed = parseCallbackData(cbq.data);
   if (!parsed) return;
 
@@ -107,7 +118,7 @@ export async function handleModifyReply(message, { telegramClient, draftStore, r
   await approval.sendForApproval(newId, { telegramClient, draftStore, chatId });
 }
 
-export function createPollLoop({ telegramClient, draftStore, archive, approval, router, pairedUserId, commands }) {
+export function createPollLoop({ telegramClient, draftStore, archive, approval, router, pairedUserId, commands, sourceCb }) {
   let running = true;
   let offset = 0;
   let backoff = 1000;
@@ -131,6 +142,7 @@ export function createPollLoop({ telegramClient, draftStore, archive, approval, 
                 telegramClient,
                 draftStore,
                 archive,
+                sourceCb,
               });
             } else if (update.message?.text?.startsWith("/")) {
               const text = update.message.text;
