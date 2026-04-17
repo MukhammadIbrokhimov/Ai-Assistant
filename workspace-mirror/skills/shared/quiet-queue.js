@@ -69,5 +69,26 @@ export function createQuietQueue({ path }) {
     });
   }
 
-  return { append, peek, drain };
+  function commitDrain() {
+    return withLock(() => {
+      if (existsSync(processingPath)) unlinkSync(processingPath);
+    });
+  }
+
+  function putBack(entries) {
+    return withLock(() => {
+      const lateAppends = readLines(path);
+      const combined = [...entries, ...lateAppends];
+      if (combined.length === 0) {
+        if (existsSync(path)) unlinkSync(path);
+      } else {
+        const tmpOut = path + ".tmp";
+        writeFileSync(tmpOut, combined.map(e => JSON.stringify(e)).join("\n") + "\n");
+        renameSync(tmpOut, path);
+      }
+      if (existsSync(processingPath)) unlinkSync(processingPath);
+    });
+  }
+
+  return { append, peek, drain, commitDrain, putBack };
 }

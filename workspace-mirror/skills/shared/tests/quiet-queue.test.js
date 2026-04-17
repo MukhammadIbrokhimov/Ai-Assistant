@@ -77,3 +77,37 @@ describe("drain", () => {
     expect(entries.map(e => e.draft_id)).toEqual(["a"]);
   });
 });
+
+describe("commitDrain + putBack", () => {
+  it("commitDrain removes the .processing file", () => {
+    qq.append({ draft_id: "a", created_at: "t", mode: "clip", topic: "x" });
+    qq.drain();
+    expect(existsSync(join(tmp, "quiet-queue.jsonl.processing"))).toBe(true);
+    qq.commitDrain();
+    expect(existsSync(join(tmp, "quiet-queue.jsonl.processing"))).toBe(false);
+  });
+
+  it("commitDrain with no .processing is a no-op", () => {
+    expect(() => qq.commitDrain()).not.toThrow();
+  });
+
+  it("putBack restores entries and removes .processing", () => {
+    qq.append({ draft_id: "a", created_at: "t", mode: "clip", topic: "x" });
+    const entries = qq.drain();
+    qq.putBack(entries);
+    expect(existsSync(join(tmp, "quiet-queue.jsonl"))).toBe(true);
+    expect(existsSync(join(tmp, "quiet-queue.jsonl.processing"))).toBe(false);
+    expect(qq.peek()).toHaveLength(1);
+    expect(qq.peek()[0].draft_id).toBe("a");
+  });
+
+  it("putBack preserves entries appended during drain", () => {
+    qq.append({ draft_id: "a", created_at: "t", mode: "clip", topic: "x" });
+    const entries = qq.drain();
+    qq.append({ draft_id: "b", created_at: "t", mode: "slideshow", topic: "y" });
+    qq.putBack(entries);
+    const remaining = qq.peek();
+    expect(remaining).toHaveLength(2);
+    expect(remaining.map(e => e.draft_id)).toEqual(["a", "b"]);
+  });
+});
