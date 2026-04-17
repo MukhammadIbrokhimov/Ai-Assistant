@@ -1,0 +1,9 @@
+{
+  "name": "report",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "scripts": { "test": "vitest run", "test:watch": "vitest" },
+  "dependencies": { "shared": "file:../shared", "js-yaml": "^4.1.0" },
+  "devDependencies": { "vitest": "^2.0.0" }
+}
