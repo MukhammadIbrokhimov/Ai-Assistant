@@ -47,3 +47,33 @@ describe("append + peek", () => {
     expect(() => qq.append({ created_at: "t", mode: "clip", topic: "x" })).toThrow(/draft_id/);
   });
 });
+
+describe("drain", () => {
+  it("drain returns all entries and moves file to .processing", () => {
+    qq.append({ draft_id: "a", created_at: "t", mode: "clip", topic: "x" });
+    qq.append({ draft_id: "b", created_at: "t", mode: "slideshow", topic: "y" });
+    const entries = qq.drain();
+    expect(entries.map(e => e.draft_id)).toEqual(["a", "b"]);
+    expect(existsSync(join(tmp, "quiet-queue.jsonl"))).toBe(false);
+    expect(existsSync(join(tmp, "quiet-queue.jsonl.processing"))).toBe(true);
+  });
+
+  it("drain on missing file returns empty array", () => {
+    expect(qq.drain()).toEqual([]);
+  });
+
+  it("drain recovers orphan .processing from prior crash", () => {
+    qq.append({ draft_id: "a", created_at: "t", mode: "clip", topic: "x" });
+    qq.drain();
+    qq.append({ draft_id: "b", created_at: "t", mode: "slideshow", topic: "y" });
+    const entries = qq.drain();
+    expect(entries.map(e => e.draft_id)).toEqual(["a", "b"]);
+  });
+
+  it("drain + second drain with no new appends returns orphans only", () => {
+    qq.append({ draft_id: "a", created_at: "t", mode: "clip", topic: "x" });
+    qq.drain();
+    const entries = qq.drain();
+    expect(entries.map(e => e.draft_id)).toEqual(["a"]);
+  });
+});

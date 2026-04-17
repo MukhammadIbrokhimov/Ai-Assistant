@@ -51,5 +51,23 @@ export function createQuietQueue({ path }) {
     return readLines(path);
   }
 
-  return { append, peek };
+  function drain() {
+    return withLock(() => {
+      const orphan = readLines(processingPath);
+      const current = readLines(path);
+      if (existsSync(path)) {
+        if (orphan.length > 0) {
+          const combined = [...orphan, ...current];
+          const body = combined.map(e => JSON.stringify(e)).join("\n") + (combined.length > 0 ? "\n" : "");
+          writeFileSync(processingPath, body);
+          unlinkSync(path);
+        } else {
+          renameSync(path, processingPath);
+        }
+      }
+      return [...orphan, ...current];
+    });
+  }
+
+  return { append, peek, drain };
 }
