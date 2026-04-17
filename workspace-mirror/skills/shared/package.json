@@ -8,7 +8,9 @@
     "./telegram-client": "./telegram-client.js",
     "./draft-store": "./draft-store.js",
     "./schemas": "./schemas.js",
-    "./sources-store": "./sources-store.js"
+    "./sources-store": "./sources-store.js",
+    "./jsonl-logger": "./jsonl-logger.js",
+    "./quiet-queue": "./quiet-queue.js"
   },
   "scripts": {
     "test": "vitest run",
