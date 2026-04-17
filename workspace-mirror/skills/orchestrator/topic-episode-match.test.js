@@ -54,3 +54,36 @@ describe("matchTopicToEpisode — keyword fallback path", () => {
     expect(res).toBeNull();
   });
 });
+
+describe("matchTopicToEpisode — LLM path", () => {
+  const now = new Date("2026-04-17T12:00:00Z");
+  const transcripts = [
+    { source_id: "lex", episode_id: "ep-1", title: "Sam Altman on AI agents", transcribed_at: "2026-04-16T10:00:00Z", segments: [{ t_start: 0, t_end: 3, text: "AI agents and autonomous systems discussion." }] },
+    { source_id: "lex", episode_id: "ep-2", title: "AI coding assistants", transcribed_at: "2026-04-16T10:00:00Z", segments: [{ t_start: 0, t_end: 3, text: "Copilot and cursor and AI dev tools." }] },
+  ];
+  const topics = [
+    { topic: "AI agents replacing junior devs", source_url: "u1", score: 1, niche: "ai" },
+  ];
+
+  it("LLM picks a candidate with confidence >= 0.5 → via:llm", async () => {
+    const router = { complete: async () => JSON.stringify({ best_episode_id: "ep-1", confidence: 0.82, reasoning: "AI agents match" }) };
+    const res = await matchTopicToEpisode(topics, transcripts, router, { now });
+    expect(res.via).toBe("llm");
+    expect(res.episode.episode_id).toBe("ep-1");
+    expect(res.confidence).toBe(0.82);
+  });
+
+  it("LLM low confidence → falls through to keyword top-1", async () => {
+    const router = { complete: async () => JSON.stringify({ best_episode_id: "ep-1", confidence: 0.3 }) };
+    const res = await matchTopicToEpisode(topics, transcripts, router, { now });
+    expect(res).not.toBeNull();
+    expect(res.via).toBe("keyword");
+  });
+
+  it("LLM returns episode_id not in candidate set → falls through", async () => {
+    const router = { complete: async () => JSON.stringify({ best_episode_id: "ep-hallucinated", confidence: 0.99 }) };
+    const res = await matchTopicToEpisode(topics, transcripts, router, { now });
+    expect(res).not.toBeNull();
+    expect(res.via).toBe("keyword");
+  });
+});
