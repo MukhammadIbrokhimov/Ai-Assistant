@@ -21,6 +21,32 @@ describe("parseSrt", () => {
     expect(parseSrt("")).toEqual([]);
     expect(parseSrt("\n\n\n")).toEqual([]);
   });
+
+  it("collapses consecutive duplicate segments into one (whisper hallucination loop)", () => {
+    const srt = [
+      "1", "00:00:10,000 --> 00:00:11,000", "Same line.", "",
+      "2", "00:00:11,000 --> 00:00:12,000", "Same line.", "",
+      "3", "00:00:12,000 --> 00:00:13,000", "Same line.", "",
+      "4", "00:00:13,000 --> 00:00:14,000", "Different line.", "",
+    ].join("\n");
+    expect(parseSrt(srt)).toEqual([
+      { t_start: 10, t_end: 13, text: "Same line." },
+      { t_start: 13, t_end: 14, text: "Different line." },
+    ]);
+  });
+
+  it("does not merge non-consecutive duplicates", () => {
+    const srt = [
+      "1", "00:00:01,000 --> 00:00:02,000", "Hi.", "",
+      "2", "00:00:02,000 --> 00:00:03,000", "Bye.", "",
+      "3", "00:00:03,000 --> 00:00:04,000", "Hi.", "",
+    ].join("\n");
+    expect(parseSrt(srt)).toEqual([
+      { t_start: 1, t_end: 2, text: "Hi." },
+      { t_start: 2, t_end: 3, text: "Bye." },
+      { t_start: 3, t_end: 4, text: "Hi." },
+    ]);
+  });
 });
 
 function fakeSpawn(handlers) {

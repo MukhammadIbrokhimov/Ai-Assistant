@@ -1,6 +1,16 @@
 import { spawn as nodeSpawn } from "node:child_process";
 import { readFileSync, existsSync, unlinkSync } from "node:fs";
 
+export function dedupeConsecutive(segments) {
+  const out = [];
+  for (const s of segments) {
+    const prev = out[out.length - 1];
+    if (prev && prev.text === s.text) prev.t_end = s.t_end;
+    else out.push({ ...s });
+  }
+  return out;
+}
+
 export function parseSrt(srt) {
   const segments = [];
   const blocks = srt.split(/\n\s*\n/);
@@ -22,7 +32,7 @@ export function parseSrt(srt) {
       text: textLines.join(" ").trim(),
     });
   }
-  return segments;
+  return dedupeConsecutive(segments);
 }
 
 function runProcess(spawnFn, binary, args) {
