@@ -1,5 +1,15 @@
-import { spawn } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { spawn as nodeSpawn } from "node:child_process";
+import { readFileSync, existsSync, unlinkSync } from "node:fs";
+
+export function dedupeConsecutive(segments) {
+  const out = [];
+  for (const s of segments) {
+    const prev = out[out.length - 1];
+    if (prev && prev.text === s.text) prev.t_end = s.t_end;
+    else out.push({ ...s });
+  }
+  return out;
+}
 
 export function parseSrt(srt) {
   const segments = [];
@@ -22,26 +32,51 @@ export function parseSrt(srt) {
       text: textLines.join(" ").trim(),
     });
   }
-  return segments;
+  return dedupeConsecutive(segments);
 }
 
-export function createWhisperRunner({ binary = "whisper-cli", modelPath }) {
-  async function runWhisper(audioPath) {
-    return new Promise((resolve, reject) => {
-      const proc = spawn(binary, ["-m", modelPath, "-l", "en", "-osrt", "-of", audioPath, audioPath]);
-      let err = "";
-      proc.stderr.on("data", (d) => { err += d; });
-      proc.on("close", (code) => {
-        if (code !== 0) return reject(new Error(`whisper exit ${code}: ${err}`));
-        try {
-          const srt = readFileSync(`${audioPath}.srt`, "utf8");
-          resolve(srt);
-        } catch (e) {
-          reject(e);
-        }
-      });
-      proc.on("error", reject);
+function runProcess(spawnFn, binary, args) {
+  return new Promise((resolve, reject) => {
+    const proc = spawnFn(binary, args);
+    let err = "";
+    proc.stderr.on("data", (d) => { err += d; });
+    proc.on("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`${binary} exit ${code}: ${err}`));
     });
+    proc.on("error", reject);
+  });
+}
+
+export function createWhisperRunner({
+  binary = "whisper-cli",
+  ffmpegBinary = "ffmpeg",
+  modelPath,
+  spawn = nodeSpawn,
+}) {
+  async function runWhisper(audioPath) {
+    const isWav = audioPath.toLowerCase().endsWith(".wav");
+    const wavPath = isWav ? audioPath : `${audioPath}.whisper.wav`;
+    let tempWav = null;
+    if (!isWav) {
+      await runProcess(spawn, ffmpegBinary, [
+        "-y", "-i", audioPath,
+        "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
+        wavPath,
+      ]);
+      tempWav = wavPath;
+    }
+    const srtPath = `${wavPath}.srt`;
+    try {
+      await runProcess(spawn, binary, ["-m", modelPath, "-l", "en", "-osrt", "-of", wavPath, wavPath]);
+      return readFileSync(srtPath, "utf8");
+    } finally {
+      for (const p of [tempWav, srtPath]) {
+        if (p && existsSync(p)) {
+          try { unlinkSync(p); } catch { /* ignore */ }
+        }
+      }
+    }
   }
   return { runWhisper };
 }
