@@ -53,9 +53,9 @@ Three changes, one PR:
    - `audio_path`, `video_path`: absolute paths, matching `whitelist-scan/index.js:42-43`.
    - `duration_s`: from `ffprobe -i <video> -show_entries format=duration -v quiet -of csv="p=0"`.
    - `title`: from `yt-dlp --skip-download --print "%(title)s" "https://youtu.be/<episode_id>"`. On any failure, falls back to `episode_id`.
-   - `published_at`: from `yt-dlp --skip-download --print "%(upload_date)s"` (YYYYMMDD → ISO date). Falls back to `null`.
+   - `published_at`: from `yt-dlp --skip-download --print "%(upload_date)s"`, formatted as `YYYY-MM-DDT00:00:00Z` to match the format `whitelist-scan/ytdlp.js` produces. Falls back to `null`.
    - `video_pruned_at`: `null` (matches `whitelist-scan/index.js:53`).
-3. **Idempotent:** if a `manifest.json` already exists, merge — keep existing entries, only add missing `episode_id`s. Re-running must not destroy data once `scan.js` starts maintaining it.
+3. **Idempotent merge with stale-entry pruning:** if a `manifest.json` already exists, merge — keep existing entries whose `video_path` still resolves on disk (skipping `ffprobe`/`yt-dlp` re-fetch for them), drop existing entries whose `video_path` no longer exists (so a manually-deleted file doesn't keep handing `clip-extract` a dangling path), and add new `episode_id`s found in the audio∩video intersection. Re-running must not destroy data once `scan.js` starts maintaining it.
 4. Sort entries by `published_at` desc (stable fallback to `episode_id` for nulls).
 5. Write atomically via `tmpPath + renameSync`, matching `sources-store.js:21-25`.
 
@@ -65,7 +65,7 @@ Three changes, one PR:
 - Per-episode `yt-dlp` failure (network off, video private, etc.): warn, use fallback values, continue.
 - Per-episode `ffprobe` failure: skip that episode entirely — `duration_s` is required by downstream consumers.
 
-**Dependencies:** `ffprobe` (ships with ffmpeg, already a project dep per `clip-extract/ffmpeg.js`); `yt-dlp` (already used by `whitelist-scan/ytdlp.js`).
+**Dependencies:** `ffprobe` (typically ships alongside `ffmpeg`, but is not invoked elsewhere in the repo today — fail with a clear install hint if absent); `yt-dlp` (already used by `whitelist-scan/ytdlp.js`).
 
 **Test (`backfill-manifest.test.js`):** mock `readdirSync` and `execFile`. Cases: intersection logic, yt-dlp fallback, idempotent merge with pre-existing manifest, ffprobe failure skips episode, output schema matches consumer expectations.
 
@@ -77,10 +77,12 @@ Currently walks `transcript-cache/<source>/<episode>.json` and returns raw trans
 
 1. Track `<source>` directory name as `source_id` while walking.
 2. For each `<source>`, read the matching `audio-cache/<source>/manifest.json` once. Cache as a `Map<episode_id, manifestEntry>`.
-3. For each transcript, look up the manifest entry by `transcript.episode_id`. Merge `video_path` and `source_id` onto the transcript object. Skip transcripts whose manifest entry is missing (`console.warn` once, don't throw).
+3. For each transcript, look up the manifest entry by `transcript.episode_id`. Merge `video_path` onto the transcript object. Skip transcripts whose manifest entry is missing (`console.warn` once, don't throw).
 4. Return the merged array.
 
 Rationale: `loadTranscripts` is the only place that knows about the cache layout, so the join belongs there. Daily-loop stays declarative.
+
+**Note on `source_id`:** transcripts produced by `bin/transcribe.js` already carry `source_id` (required by `validateTranscript` in `shared/schemas.js:24`, written by `transcribe/index.js:13`). The join's load-bearing field is `video_path`. Implementations may also overwrite `source_id` from the directory name as a defensive fallback for legacy transcripts, but it's not strictly required.
 
 **Error handling:**
 
@@ -100,7 +102,7 @@ Add: load `config/sources.yaml` once via `createSourcesStore({ path: ... }).list
   case "clip": {
     const transcript = episode ? transcripts.find(t => t.episode_id === episode.episode_id) : null;
     const source = transcript ? sourcesById.get(transcript.source_id) : null;
-    if (!transcript || !source) return null;
+    if (!transcript || !source || !transcript.video_path) return null;
     return (await skills.clipExtract.run({
       transcript,
       source,
@@ -109,16 +111,17 @@ Add: load `config/sources.yaml` once via `createSourcesStore({ path: ... }).list
   }
   ```
 
-- Guard the `null` return at the existing call site (line 118): if `callSkill` returns `null`, push `{ mode, ok: false, reason: "missing_source_or_video" }` into results and continue. Matches the existing skip-with-reason pattern at line 154.
+- Guard the `null` return at the existing call site (between current lines 118 and 119): if `callSkill` returns `null`, push `{ mode, ok: false, reason: "missing_source_or_video" }` into results and `continue` the outer loop instead of dereferencing `draft.id`. Matches the existing skip-with-reason pattern at line 154.
 
 Note: `matchTopicToEpisode` returns the merged transcript itself, so `episode === transcript` is the same object. The variable name stays for now; the meaningful change is sourcing `source` from the lookup.
 
 **Tests:**
 
 - `orchestrator.test.js` (new, small): fixture filesystem with a transcript + manifest pair; assert `video_path` and `source_id` are attached. Cover missing-manifest and missing-entry warn/skip paths.
-- `daily-loop.test.js` (extend): provide `sourcesById` Map. Two new cases:
+- `daily-loop.test.js` (extend): provide `sourcesById` Map. Three new cases:
   - Happy path: transcript with `source_id` resolves to a source; `clipExtract.run` called with `{transcript, source, videoPath}`.
   - Unknown `source_id`: mode skipped with reason `missing_source_or_video`; no throw.
+  - Transcript resolved to a source but `video_path` undefined (manifest lookup miss in `loadTranscripts`): mode skipped with reason `missing_source_or_video`; `clipExtract.run` is never called (so ffmpeg can't crash on a missing path).
 
 ## Component 3 — `sources.yaml` lex-fridman entry
 
@@ -164,3 +167,5 @@ Pre-conditions before the smoke run (runbook in PR description, not code):
 - **License labeling editorial choice may not reflect Lex's actual terms** → noted in PR description; user can flip to `unclear` post-merge with no code change.
 - **`scan.js` re-running could overwrite a backfilled manifest** → idempotent merge in backfill protects on the backfill side, and `scan.js` already only appends new episodes (line 46-54), so it shouldn't drop existing entries either. Cross-checked.
 - **Transcript-cache directory does not currently exist on disk** → `loadTranscripts` already handles this (`existsSync` guard at line 134); no behavior change for the empty case.
+- **Stale manifest entries (file deleted after manifest written)** → handled by the backfill's stale-entry pruning step (Component 1, step 3): re-running backfill drops manifest entries whose `video_path` no longer resolves on disk. For runtime defense, `callSkill("clip")`'s `!transcript.video_path` guard prevents calling ffmpeg with a missing path. If a file is deleted between `loadTranscripts` and `clipExtract.run` (very narrow race), ffmpeg fails loudly into the existing try/catch at daily-loop.js:120 — surfaced as a skipped mode, not a crash.
+- **`source.niches[0]` indirectly required** → `clip-extract/index.js:55` indexes `source.niches[0]`. A `sources.yaml` entry that omits `niches` would crash inside `clipExtract.run`. Not a bug for this PR (the lex-fridman entry has `niches: [ai]`), but flagged so future hand-written entries include it.
