@@ -133,10 +133,80 @@ describe("runDailyLoop — retry + failure + quiet-hours", () => {
 
   it("silent on fully successful day", async () => {
     const transcripts = [
-      { source_id: "lex", episode_id: "ep-1", title: "AI agents replacing junior devs", transcribed_at: "2026-04-16T10:00:00Z", segments: [{ t_start: 0, t_end: 3, text: "AI agents discussion" }] },
+      { source_id: "lex", episode_id: "ep-1", title: "AI agents replacing junior devs", transcribed_at: "2026-04-16T10:00:00Z", segments: [{ t_start: 0, t_end: 3, text: "AI agents discussion" }], video_path: "/cache/video-cache/lex/ep-1.mp4" },
     ];
-    const deps = makeDeps({ transcripts });
+    const sourcesById = new Map([["lex", { id: "lex", creator: "Lex", url: "https://example.test", attribution_template: '— {creator}', niches: ["ai"], license: "permission-granted" }]]);
+    const deps = makeDeps({ transcripts, sourcesById });
     await runDailyLoop(deps);
     expect(deps.telegramClient.sendMessage).not.toHaveBeenCalled();
+  });
+});
+
+describe("runDailyLoop — clip mode source/video wiring (kn9)", () => {
+  function makeClipDeps(overrides = {}) {
+    const transcript = {
+      source_id: "lex-fridman",
+      episode_id: "ep1",
+      title: "Whatever this Episode is",
+      language: "en",
+      duration_s: 3600,
+      transcribed_at: new Date().toISOString(),
+      model: "whisper-large-v3",
+      segments: [
+        { t_start: 0, t_end: 50, text: "AI agents are eating the world" },
+      ],
+      video_path: "/cache/video-cache/lex-fridman/ep1.mp4",
+    };
+    const source = {
+      id: "lex-fridman",
+      creator: "Lex Fridman",
+      url: "https://www.youtube.com/@lexfridman",
+      attribution_template: '— {creator}, "{episode_title}"',
+      niches: ["ai"],
+      license: "permission-granted",
+    };
+    const matchingTopic = { topic: "AI agents replacing junior devs", source_url: "https://a.test/1", score: 0.9, niche: "ai" };
+    return {
+      ...makeDeps({
+        skills: makeSkills({
+          research: { run: vi.fn().mockResolvedValue([matchingTopic]) },
+          clipExtract: { run: vi.fn().mockResolvedValue({ draft: { id: "d-clip-real", mode: "clip" } }) },
+        }),
+        providerRouter: { complete: vi.fn().mockResolvedValue({ text: JSON.stringify({ best_episode_id: "ep1", confidence: 0.9, reasoning: "match" }) }) },
+        transcripts: [transcript],
+        sourcesById: new Map([["lex-fridman", source]]),
+      }),
+      ...overrides,
+    };
+  }
+
+  it("happy path: clipExtract.run receives sources.yaml entry as source and transcript.video_path as videoPath", async () => {
+    const deps = makeClipDeps();
+    await runDailyLoop(deps);
+    expect(deps.skills.clipExtract.run).toHaveBeenCalledTimes(1);
+    const call = deps.skills.clipExtract.run.mock.calls[0][0];
+    expect(call.source.id).toBe("lex-fridman");
+    expect(call.source.creator).toBe("Lex Fridman");
+    expect(call.source.attribution_template).toBe('— {creator}, "{episode_title}"');
+    expect(call.videoPath).toBe("/cache/video-cache/lex-fridman/ep1.mp4");
+    expect(call.transcript.episode_id).toBe("ep1");
+    expect(deps.providerRouter.complete).toHaveBeenCalled();
+  });
+
+  it("unknown source_id: clip mode is skipped with reason missing_source_or_video, no throw, no clipExtract call", async () => {
+    const deps = makeClipDeps({ sourcesById: new Map() });
+    const res = await runDailyLoop(deps);
+    expect(deps.skills.clipExtract.run).not.toHaveBeenCalled();
+    const clipResult = res.drafts.find(d => d.mode === "clip");
+    expect(clipResult).toEqual({ mode: "clip", ok: false, reason: "missing_source_or_video" });
+  });
+
+  it("transcript with no video_path: clip mode is skipped, clipExtract.run never called", async () => {
+    const deps = makeClipDeps();
+    deps.transcripts = deps.transcripts.map(t => ({ ...t, video_path: undefined }));
+    const res = await runDailyLoop(deps);
+    expect(deps.skills.clipExtract.run).not.toHaveBeenCalled();
+    const clipResult = res.drafts.find(d => d.mode === "clip");
+    expect(clipResult).toEqual({ mode: "clip", ok: false, reason: "missing_source_or_video" });
   });
 });

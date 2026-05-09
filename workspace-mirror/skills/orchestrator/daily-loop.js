@@ -39,11 +39,17 @@ function readDraftsByMode(draftsRoot, today) {
   return byMode;
 }
 
-async function callSkill(mode, skills, topic, episode, transcripts) {
+async function callSkill(mode, skills, topic, episode, transcripts, sourcesById) {
   switch (mode) {
     case "clip": {
       const transcript = episode ? transcripts.find(t => t.episode_id === episode.episode_id) : null;
-      return (await skills.clipExtract.run({ transcript, source: episode, videoPath: episode?.video_path })).draft;
+      const source = transcript ? sourcesById.get(transcript.source_id) : null;
+      if (!transcript || !source || !transcript.video_path) return null;
+      return (await skills.clipExtract.run({
+        transcript,
+        source,
+        videoPath: transcript.video_path,
+      })).draft;
     }
     case "slideshow":
       return (await skills.slideshowDraft.run({ topic: topic.topic, niche: topic.niche })).draft;
@@ -63,7 +69,7 @@ function isTransient(err) {
 
 export async function runDailyLoop({
   clock, providerRouter, skills, approval, quietQueue, logger,
-  paths, transcripts = [], telegramClient, chatId,
+  paths, transcripts = [], sourcesById = new Map(), telegramClient, chatId,
 }) {
   const today = clock instanceof Date ? clock : new Date();
   const nichesDoc = yaml.load(readFileSync(join(paths.workspace, "config/niches.yaml"), "utf8"));
@@ -115,13 +121,21 @@ export async function runDailyLoop({
     if (!assignments[mode]) continue;
     const { topic, episode } = assignments[mode];
     try {
-      const draft = await callSkill(mode, skills, topic, episode, transcripts);
+      const draft = await callSkill(mode, skills, topic, episode, transcripts, sourcesById);
+      if (draft === null) {
+        results.push({ mode, ok: false, reason: "missing_source_or_video" });
+        continue;
+      }
       results.push({ mode, draft_id: draft.id, ok: true });
     } catch (err) {
       if (isTransient(err)) {
         try {
           await new Promise(r => setTimeout(r, 2000));
-          const draft = await callSkill(mode, skills, topic, episode, transcripts);
+          const draft = await callSkill(mode, skills, topic, episode, transcripts, sourcesById);
+          if (draft === null) {
+            results.push({ mode, ok: false, reason: "missing_source_or_video" });
+            continue;
+          }
           results.push({ mode, draft_id: draft.id, ok: true });
         } catch (retryErr) {
           results.push({ mode, ok: false, reason: retryErr.message });

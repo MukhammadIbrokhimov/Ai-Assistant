@@ -1,1 +1,12 @@
-sources: []
+sources:
+  - id: lex-fridman
+    creator: Lex Fridman
+    type: youtube_channel
+    url: https://www.youtube.com/@lexfridman
+    license: permission-granted
+    license_evidence: https://lexfridman.com/about
+    attribution_required: true
+    attribution_template: '— {creator}, "{episode_title}"'
+    poll_frequency_h: 24
+    niches: [ai]
+    lastScanned: null
