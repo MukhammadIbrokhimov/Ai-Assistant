@@ -48,6 +48,8 @@ git update-ref refs/heads/fix/transcribe-m4a-wav-conversion 68603b6
 
 Expected: `git log fix/transcribe-m4a-wav-conversion --oneline -3` shows `68603b6` as HEAD with no spec commits. (We don't delete the branch — per memory, never delete branches.)
 
+**Note:** `origin/fix/transcribe-m4a-wav-conversion` already ends at `68603b6` — the spec/plan commits never reached the remote. After this `update-ref`, `git status` on the transcribe branch will report "up to date with origin/fix/transcribe-m4a-wav-conversion" — no force-push needed.
+
 - [ ] **Step 5: Claim beads issues**
 
 ```bash
@@ -787,6 +789,7 @@ describe("runDailyLoop — clip mode source/video wiring (kn9)", () => {
     expect(call.source.attribution_template).toBe('— {creator}, "{episode_title}"');
     expect(call.videoPath).toBe("/cache/video-cache/lex-fridman/ep1.mp4");
     expect(call.transcript.episode_id).toBe("ep1");
+    expect(deps.providerRouter.complete).toHaveBeenCalled();
   });
 
   it("unknown source_id: clip mode is skipped with reason missing_source_or_video, no throw, no clipExtract call", async () => {
@@ -986,6 +989,7 @@ cd ../transcribe && npx vitest run
 cd ../poller && npx vitest run
 cd ../research && npx vitest run
 cd ../slideshow-draft && npx vitest run
+cd ../quotecard-draft && npx vitest run
 cd ../source-discovery && npx vitest run
 cd ../report && npx vitest run
 cd ../approval && npx vitest run
@@ -1097,7 +1101,7 @@ Expected: prints PR URL.
 - [ ] **Step 2b (gh missing): Print PR-create URL for the user**
 
 ```bash
-echo "Open: https://github.com/MukhammadIbrokhimov/openclaw/pull/new/feat/clip-pipeline-wiring"
+echo "Open: https://github.com/MukhammadIbrokhimov/Ai-Assistant/pull/new/feat/clip-pipeline-wiring"
 ```
 
 Expected: URL printed; user clicks it and uses the title/body from Step 2a's content.
