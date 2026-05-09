@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
 import yaml from "js-yaml";
 import { createLogger } from "shared/jsonl-logger";
 import { createQuietQueue } from "shared/quiet-queue";
