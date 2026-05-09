@@ -1,9 +1,11 @@
 #!/usr/bin/env node
-import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import yaml from "js-yaml";
 import { createLogger } from "shared/jsonl-logger";
 import { createQuietQueue } from "shared/quiet-queue";
+import { createSourcesStore } from "shared/sources-store";
+import { loadTranscripts } from "../load-transcripts.js";
 
 const HOME = process.env.HOME;
 const args = process.argv.slice(2);
@@ -129,18 +131,9 @@ async function loadSkillsAndRouter() {
   };
 }
 
-function loadTranscripts() {
-  const root = `${DRAFTS}/whitelist/transcript-cache`;
-  if (!existsSync(root)) return [];
-  const out = [];
-  for (const source of readdirSync(root, { withFileTypes: true })) {
-    if (!source.isDirectory()) continue;
-    for (const f of readdirSync(join(root, source.name))) {
-      if (!f.endsWith(".json")) continue;
-      try { out.push(JSON.parse(readFileSync(join(root, source.name, f), "utf8"))); } catch {}
-    }
-  }
-  return out;
+function loadSourcesById() {
+  const store = createSourcesStore({ path: `${WORKSPACE}/config/sources.yaml` });
+  return new Map(store.list().map(s => [s.id, s]));
 }
 
 async function main() {
@@ -156,7 +149,8 @@ async function main() {
         quietQueue,
         logger,
         paths: { workspace: WORKSPACE, drafts: DRAFTS },
-        transcripts: loadTranscripts(),
+        transcripts: loadTranscripts({ draftsRoot: DRAFTS, log: { warn: (m) => logger.jsonl({ event: "load_transcripts_warn", msg: m }) } }),
+        sourcesById: loadSourcesById(),
         telegramClient: d.telegramClient,
         chatId: d.chatId,
       });
