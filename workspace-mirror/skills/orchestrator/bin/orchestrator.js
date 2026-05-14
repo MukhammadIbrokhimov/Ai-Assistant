@@ -34,6 +34,7 @@ async function loadSkillsAndRouter() {
   const ollama = (await import(`${WORKSPACE}/skills/provider-router/providers/ollama.js`)).default;
   const anthropic = (await import(`${WORKSPACE}/skills/provider-router/providers/anthropic.js`)).default;
   const { createResearch } = await import(`${WORKSPACE}/skills/research/index.js`);
+  const { createBraveSearch, withSearchLogging } = await import(`${WORKSPACE}/skills/research/web-search.js`);
   const { createSlideshowDraft } = await import(`${WORKSPACE}/skills/slideshow-draft/index.js`);
   const { createPexelsClient } = await import(`${WORKSPACE}/skills/slideshow-draft/pexels.js`);
   const { createQuotecardDraft, createRenderCard } = await import(`${WORKSPACE}/skills/quotecard-draft/index.js`);
@@ -73,10 +74,18 @@ async function loadSkillsAndRouter() {
   const idFor = (mode) =>
     `${new Date().toISOString().slice(0, 10)}-${mode}-${Math.random().toString(36).slice(2, 6)}`;
 
+  const braveKey = process.env.BRAVE_SEARCH_API_KEY;
+  let browserSearch;
+  if (braveKey) {
+    browserSearch = withSearchLogging(createBraveSearch({ apiKey: braveKey }), { logger });
+  } else {
+    logger.jsonl({ event: "web_search_disabled", reason: "BRAVE_SEARCH_API_KEY not set" });
+    browserSearch = async () => [];
+  }
   const research = createResearch({
     readFileSync,
     nichesPath: `${WORKSPACE}/config/niches.yaml`,
-    browserSearch: async () => [],
+    browserSearch,
     router,
     logger,
   });
