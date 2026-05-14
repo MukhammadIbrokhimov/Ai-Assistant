@@ -50,6 +50,7 @@ if (ORCHESTRATOR) {
   const ollama = (await import(`${WS}/skills/provider-router/providers/ollama.js`)).default;
   const anthropic = (await import(`${WS}/skills/provider-router/providers/anthropic.js`)).default;
   const { createResearch } = await import(`${WS}/skills/research/index.js`);
+  const { createBraveSearch } = await import(`${WS}/skills/research/web-search.js`);
   const { createSlideshowDraft } = await import(`${WS}/skills/slideshow-draft/index.js`);
   const { createPexelsClient } = await import(`${WS}/skills/slideshow-draft/pexels.js`);
   const { createQuotecardDraft, createRenderCard } = await import(`${WS}/skills/quotecard-draft/index.js`);
@@ -90,7 +91,9 @@ if (ORCHESTRATOR) {
   const research = createResearch({
     readFileSync,
     nichesPath: `${LIVE_WS}/config/niches.yaml`,
-    browserSearch: async () => [],
+    browserSearch: process.env.BRAVE_SEARCH_API_KEY
+      ? createBraveSearch({ apiKey: process.env.BRAVE_SEARCH_API_KEY })
+      : async () => [],
     router,
   });
 
@@ -169,6 +172,7 @@ const { createRouter } = await import(`${WS}/skills/provider-router/router.js`);
 const ollama = (await import(`${WS}/skills/provider-router/providers/ollama.js`)).default;
 const anthropic = (await import(`${WS}/skills/provider-router/providers/anthropic.js`)).default;
 const { createResearch } = await import(`${WS}/skills/research/index.js`);
+const { createBraveSearch: createBraveSearchTop } = await import(`${WS}/skills/research/web-search.js`);
 const { createSlideshowDraft } = await import(`${WS}/skills/slideshow-draft/index.js`);
 const { createQuotecardDraft, createRenderCard } = await import(`${WS}/skills/quotecard-draft/index.js`);
 const { createClipExtract } = await import(`${WS}/skills/clip-extract/index.js`);
@@ -186,7 +190,9 @@ const router = createRouter({
 const research = createResearch({
   readFileSync,
   nichesPath: `${LIVE_WS}/config/niches.yaml`,
-  browserSearch: async () => [],
+  browserSearch: process.env.BRAVE_SEARCH_API_KEY
+    ? createBraveSearchTop({ apiKey: process.env.BRAVE_SEARCH_API_KEY })
+    : async () => [],
   router,
 });
 const topics = await research.run("ai");

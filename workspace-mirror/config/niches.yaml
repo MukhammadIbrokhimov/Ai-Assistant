@@ -1,3 +1,8 @@
+# Per-niche research config consumed by skills/research/index.js.
+# - rss: feeds polled every daily-loop fire
+# - web_search_queries: only fires when BRAVE_SEARCH_API_KEY is set in .env
+#   (otherwise research falls back to RSS-only; see workspace-mirror/TOOLS.md)
+# - keywords_must_include/exclude: case-insensitive title filter applied to both sources
 niches:
   ai:
     rss:
