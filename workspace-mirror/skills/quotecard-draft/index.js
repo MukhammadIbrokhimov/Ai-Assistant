@@ -84,9 +84,9 @@ export function createQuotecardDraft(deps) {
       hashtags,
       media: [{ path: "media/card.png", type: "image" }],
       source: null,
-      provider_used: quoteResp.provider || null,
-      tokens_in: (quoteResp.tokens_in || 0) + (capResp.tokens_in || 0) + (hashResp.tokens_in || 0),
-      tokens_out: (quoteResp.tokens_out || 0) + (capResp.tokens_out || 0) + (hashResp.tokens_out || 0),
+      provider_used: quoteResp.providerUsed || null,
+      tokens_in: (quoteResp.tokensIn || 0) + (capResp.tokensIn || 0) + (hashResp.tokensIn || 0),
+      tokens_out: (quoteResp.tokensOut || 0) + (capResp.tokensOut || 0) + (hashResp.tokensOut || 0),
       status: "pending",
       parent_id: null,
     };

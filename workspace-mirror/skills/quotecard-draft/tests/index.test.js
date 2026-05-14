@@ -7,10 +7,10 @@ function makeDeps(overrides = {}) {
       complete: vi.fn(async ({ taskClass, prompt }) => {
         if (taskClass === "extract" || taskClass === "write") {
           if (/quote/i.test(prompt) && !/caption/i.test(prompt) && !/hashtag/i.test(prompt)) {
-            return { text: "AI agents won't replace junior devs — they'll create them.", tokens_in: 100, tokens_out: 20 };
+            return { text: "AI agents won't replace junior devs — they'll create them.", tokensIn: 100, tokensOut: 20, providerUsed: "ollama:qwen2.5:14b" };
           }
-          if (/caption/i.test(prompt)) return { text: "The future of junior devs.", tokens_in: 50, tokens_out: 15 };
-          if (/hashtag/i.test(prompt)) return { text: "#ai #agents #dev #coding #future #tech #career #software #growth #learning", tokens_in: 50, tokens_out: 20 };
+          if (/caption/i.test(prompt)) return { text: "The future of junior devs.", tokensIn: 50, tokensOut: 15, providerUsed: "ollama:qwen2.5:14b" };
+          if (/hashtag/i.test(prompt)) return { text: "#ai #agents #dev #coding #future #tech #career #software #growth #learning", tokensIn: 50, tokensOut: 20, providerUsed: "ollama:qwen2.5:14b" };
         }
         throw new Error(`unexpected ${taskClass} / ${prompt.slice(0, 40)}`);
       }),
@@ -60,5 +60,14 @@ describe("quotecard-draft", () => {
     const { draft } = await q.run({ topic: "test", niche: "ai" });
     expect(draft.caption).toBeTruthy();
     expect(draft.hashtags.length).toBeGreaterThan(5);
+  });
+
+  it("draft records non-zero tokens_in/tokens_out and provider_used from router response", async () => {
+    const deps = makeDeps();
+    const q = createQuotecardDraft(deps);
+    const { draft } = await q.run({ topic: "test", niche: "ai" });
+    expect(draft.tokens_in).toBe(100 + 50 + 50);
+    expect(draft.tokens_out).toBe(20 + 15 + 20);
+    expect(draft.provider_used).toBe("ollama:qwen2.5:14b");
   });
 });
