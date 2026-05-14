@@ -81,6 +81,37 @@ describe("research", () => {
     expect(deps.browserSearch).toHaveBeenCalledTimes(1);
   });
 
+  it("emits research_stage_counts with per-stage counts when logger is injected", async () => {
+    const events = [];
+    const deps = makeDeps({ logger: { jsonl: (e) => events.push(e) } });
+    const r = createResearch(deps);
+    await r.run("ai");
+    const counts = events.find(e => e.event === "research_stage_counts");
+    expect(counts).toBeDefined();
+    expect(counts.niche).toBe("ai");
+    expect(counts.rss).toBeGreaterThan(0);
+    expect(counts).toHaveProperty("filtered");
+    expect(counts).toHaveProperty("deduped");
+    expect(counts).toHaveProperty("ranked");
+  });
+
+  it("emits research_stage_counts with zeros when filter strips everything (distinguishes from rss failure)", async () => {
+    const events = [];
+    const deps = makeDeps({
+      fetchRss: vi.fn(async () => [{ title: "unrelated headline", link: "https://x.com/a" }]),
+      browserSearch: vi.fn(async () => []),
+      logger: { jsonl: (e) => events.push(e) },
+    });
+    const r = createResearch(deps);
+    const topics = await r.run("ai");
+    expect(topics).toEqual([]);
+    const counts = events.find(e => e.event === "research_stage_counts");
+    expect(counts.rss).toBe(1);
+    expect(counts.filtered).toBe(0);
+    expect(counts.deduped).toBe(0);
+    expect(counts.ranked).toBe(0);
+  });
+
   it("stops calling browserSearch after 3 consecutive failures", async () => {
     const nichesYamlMany = `
 niches:
