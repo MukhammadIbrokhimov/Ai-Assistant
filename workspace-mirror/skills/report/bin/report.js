@@ -1,15 +1,21 @@
 #!/usr/bin/env node
 import { createLogger } from "shared/jsonl-logger";
-import { sendNightlyReport } from "../index.js";
+import { gatherDigestData, renderDigest, sendNightlyReport } from "../index.js";
 
 const HOME = process.env.HOME;
 const args = process.argv.slice(2);
 const sandbox = args.includes("--sandbox");
 const DRAFTS = sandbox ? "/tmp/openclaw-smoke" : `${HOME}/openclaw-drafts`;
 const WORKSPACE = `${HOME}/.openclaw/workspace`;
-const logger = createLogger(`${DRAFTS}/logs/agent.jsonl`);
 
 async function main() {
+  if (sandbox) {
+    const data = await gatherDigestData({ drafts: DRAFTS, now: new Date() });
+    process.stdout.write(renderDigest(data) + "\n");
+    console.log(JSON.stringify({ ok: true, sandbox: true }));
+    return;
+  }
+  const logger = createLogger(`${DRAFTS}/logs/agent.jsonl`);
   const { createTelegramClient } = await import(`${WORKSPACE}/skills/shared/telegram-client.js`);
   const yaml = (await import("js-yaml")).default;
   const { readFileSync } = await import("node:fs");
