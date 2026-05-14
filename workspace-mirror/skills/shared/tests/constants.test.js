@@ -10,6 +10,7 @@ describe("constants", () => {
   test("STATUSES contains all valid status values", () => {
     expect(STATUSES).toEqual({
       PENDING: "pending",
+      PENDING_REASON: "pending_reason",
       APPROVED: "approved",
       REJECTED: "rejected",
       MODIFYING: "modifying",

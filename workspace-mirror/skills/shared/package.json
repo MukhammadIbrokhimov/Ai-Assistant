@@ -10,7 +10,9 @@
     "./schemas": "./schemas.js",
     "./sources-store": "./sources-store.js",
     "./jsonl-logger": "./jsonl-logger.js",
-    "./quiet-queue": "./quiet-queue.js"
+    "./quiet-queue": "./quiet-queue.js",
+    "./rejection-log": "./rejection-log.js",
+    "./rejection-preamble": "./rejection-preamble.js"
   },
   "scripts": {
     "test": "vitest run",
