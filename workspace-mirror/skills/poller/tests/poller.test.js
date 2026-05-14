@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createDraftStore } from "shared/draft-store";
@@ -7,6 +7,8 @@ import { CALLBACK_PREFIXES, STATUSES } from "shared/constants";
 import {
   handleCallback,
   handleModifyReply,
+  handleReasonReply,
+  sweepExpiredReasonWaits,
   isFromPairedUser,
 } from "../poller.js";
 
@@ -108,9 +110,10 @@ describe("handleCallback", () => {
     });
   });
 
-  test("reject: updates state, edits message, calls archive", async () => {
+  test("reject: prompts for reason via force_reply, moves to PENDING_REASON, does NOT archive yet", async () => {
     writeDraft("d-002");
     const client = mockTelegramClient();
+    client.sendMessage = vi.fn().mockResolvedValue({ message_id: 555 });
     const archive = mockArchive();
     const cbq = {
       id: "cbq-2",
@@ -121,12 +124,21 @@ describe("handleCallback", () => {
     await handleCallback(cbq, { telegramClient: client, draftStore: store, archive });
 
     expect(client.answerCallbackQuery).toHaveBeenCalledWith("cbq-2", "Rejected");
+    // Original message edited to show pending state
+    const editText = client.editMessageText.mock.calls[0][2];
+    expect(editText).toContain("awaiting reason");
+    // New force_reply prompt sent
+    const sendArgs = client.sendMessage.mock.calls[0];
+    expect(sendArgs[0]).toBe(CHAT_ID);
+    expect(sendArgs[1]).toMatch(/reason\?/i);
+    expect(sendArgs[2]?.reply_markup?.force_reply).toBe(true);
+    // Draft is in PENDING_REASON, not REJECTED
     const { state } = store.readDraft("d-002");
-    expect(state.status).toBe("rejected");
-    expect(archive.archiveDraft).toHaveBeenCalledWith("d-002", {
-      draftStore: store,
-      telegramClient: client,
-    });
+    expect(state.status).toBe(STATUSES.PENDING_REASON);
+    expect(state.reason_prompt_message_id).toBe(555);
+    expect(state.reason_asked_at).toBeDefined();
+    // No archive yet — happens after reason capture
+    expect(archive.archiveDraft).not.toHaveBeenCalled();
   });
 
   test("modify: updates state, edits message, does NOT call archive", async () => {
@@ -168,6 +180,140 @@ describe("handleCallback", () => {
     );
     const { state } = store.readDraft("d-005");
     expect(state.status).toBe("pending");
+  });
+});
+
+describe("handleReasonReply", () => {
+  test("text reply while a draft is pending_reason logs reason, finalizes state, archives", async () => {
+    writeDraft("d-100", { status: "pending_reason", reason_prompt_message_id: 555, reason_asked_at: "2026-05-14T09:00:00Z" });
+    const client = mockTelegramClient();
+    const archive = mockArchive();
+    const message = {
+      from: { id: PAIRED_USER_ID },
+      chat: { id: CHAT_ID },
+      text: "too clickbaity",
+      reply_to_message: { message_id: 555 },
+    };
+
+    const handled = await handleReasonReply(message, {
+      telegramClient: client,
+      draftStore: store,
+      archive,
+      draftsRoot: tmp,
+      now: () => new Date("2026-05-14T09:01:00Z"),
+    });
+
+    expect(handled).toBe(true);
+    // Log line written
+    const logPath = join(tmp, "logs", "rejections.jsonl");
+    expect(existsSync(logPath)).toBe(true);
+    const entry = JSON.parse(readFileSync(logPath, "utf8").trim());
+    expect(entry).toEqual({
+      ts: "2026-05-14T09:01:00.000Z",
+      draft_id: "d-100",
+      mode: "clip",
+      topic: "AI agents",
+      reason: "too clickbaity",
+    });
+    // State finalized
+    const { state } = store.readDraft("d-100");
+    expect(state.status).toBe(STATUSES.REJECTED);
+    expect(state.reject_reason).toBe("too clickbaity");
+    expect(state.resolved_at).toBe("2026-05-14T09:01:00.000Z");
+    // Archive called
+    expect(archive.archiveDraft).toHaveBeenCalledWith("d-100", expect.anything());
+  });
+
+  test("/skip records null reason and still archives", async () => {
+    writeDraft("d-101", { status: "pending_reason", reason_prompt_message_id: 555, reason_asked_at: "2026-05-14T09:00:00Z" });
+    const client = mockTelegramClient();
+    const archive = mockArchive();
+
+    const handled = await handleReasonReply(
+      { chat: { id: CHAT_ID }, text: "/skip", reply_to_message: { message_id: 555 } },
+      { telegramClient: client, draftStore: store, archive, draftsRoot: tmp, now: () => new Date("2026-05-14T09:01:00Z") }
+    );
+
+    expect(handled).toBe(true);
+    const entry = JSON.parse(readFileSync(join(tmp, "logs", "rejections.jsonl"), "utf8").trim());
+    expect(entry.reason).toBeNull();
+    const { state } = store.readDraft("d-101");
+    expect(state.reject_reason).toBeNull();
+    expect(state.status).toBe(STATUSES.REJECTED);
+    expect(archive.archiveDraft).toHaveBeenCalled();
+  });
+
+  test("returns false (no-op) when no draft is awaiting reason", async () => {
+    writeDraft("d-102"); // status: pending, not pending_reason
+    const client = mockTelegramClient();
+    const archive = mockArchive();
+
+    const handled = await handleReasonReply(
+      { chat: { id: CHAT_ID }, text: "random reply" },
+      { telegramClient: client, draftStore: store, archive, draftsRoot: tmp }
+    );
+
+    expect(handled).toBe(false);
+    expect(archive.archiveDraft).not.toHaveBeenCalled();
+    expect(existsSync(join(tmp, "logs", "rejections.jsonl"))).toBe(false);
+  });
+});
+
+describe("sweepExpiredReasonWaits", () => {
+  test("finalizes draft as rejected with null reason when ask was >5min ago", async () => {
+    writeDraft("d-200", { status: "pending_reason", reason_asked_at: "2026-05-14T09:00:00Z", reason_prompt_message_id: 555 });
+    const client = mockTelegramClient();
+    const archive = mockArchive();
+
+    const swept = await sweepExpiredReasonWaits({
+      draftStore: store,
+      archive,
+      telegramClient: client,
+      draftsRoot: tmp,
+      now: () => new Date("2026-05-14T09:06:00Z"),
+    });
+
+    expect(swept).toBe(true);
+    const entry = JSON.parse(readFileSync(join(tmp, "logs", "rejections.jsonl"), "utf8").trim());
+    expect(entry.draft_id).toBe("d-200");
+    expect(entry.reason).toBeNull();
+    const { state } = store.readDraft("d-200");
+    expect(state.status).toBe(STATUSES.REJECTED);
+    expect(state.reject_reason).toBeNull();
+    expect(archive.archiveDraft).toHaveBeenCalled();
+  });
+
+  test("no-ops when wait is <5min", async () => {
+    writeDraft("d-201", { status: "pending_reason", reason_asked_at: "2026-05-14T09:00:00Z", reason_prompt_message_id: 555 });
+    const archive = mockArchive();
+
+    const swept = await sweepExpiredReasonWaits({
+      draftStore: store,
+      archive,
+      telegramClient: mockTelegramClient(),
+      draftsRoot: tmp,
+      now: () => new Date("2026-05-14T09:04:00Z"),
+    });
+
+    expect(swept).toBe(false);
+    expect(archive.archiveDraft).not.toHaveBeenCalled();
+    expect(existsSync(join(tmp, "logs", "rejections.jsonl"))).toBe(false);
+  });
+
+  test("no-ops when no pending_reason draft exists", async () => {
+    writeDraft("d-202"); // pending only
+    const archive = mockArchive();
+
+    const swept = await sweepExpiredReasonWaits({
+      draftStore: store,
+      archive,
+      telegramClient: mockTelegramClient(),
+      draftsRoot: tmp,
+      now: () => new Date(),
+    });
+
+    expect(swept).toBe(false);
+    expect(archive.archiveDraft).not.toHaveBeenCalled();
   });
 });
 

@@ -86,7 +86,7 @@ export function createDraftStore(basePath) {
     return ids;
   }
 
-  function findModifying() {
+  function findByStatus(status) {
     if (!existsSync(pendingDir)) return null;
     const entries = readdirSync(pendingDir, { withFileTypes: true });
     for (const entry of entries) {
@@ -94,9 +94,17 @@ export function createDraftStore(basePath) {
       const statePath = join(pendingDir, entry.name, "state.json");
       if (!existsSync(statePath)) continue;
       const state = JSON.parse(readFileSync(statePath, "utf8"));
-      if (state.status === "modifying") return entry.name;
+      if (state.status === status) return entry.name;
     }
     return null;
+  }
+
+  function findModifying() {
+    return findByStatus("modifying");
+  }
+
+  function findPendingReason() {
+    return findByStatus("pending_reason");
   }
 
   return {
@@ -109,5 +117,6 @@ export function createDraftStore(basePath) {
     moveToRejected,
     listPending,
     findModifying,
+    findPendingReason,
   };
 }

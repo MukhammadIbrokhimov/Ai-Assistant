@@ -43,11 +43,13 @@ async function loadSkillsAndRouter() {
   const { createDraftStore } = await import(`${WORKSPACE}/skills/shared/draft-store.js`);
   const { sendForApproval } = await import(`${WORKSPACE}/skills/approval/approval.js`);
 
-  const router = createRouter({
+  const baseRouter = createRouter({
     configPath: `${WORKSPACE}/config/providers.yaml`,
     adapters: { ollama, anthropic },
     logPath: `${DRAFTS}/logs/router.jsonl`,
   });
+  const { withRejectionPreamble } = await import(`${WORKSPACE}/skills/shared/rejection-preamble.js`);
+  const router = withRejectionPreamble({ router: baseRouter, draftsRoot: DRAFTS });
 
   const draftStore = createDraftStore(DRAFTS);
 

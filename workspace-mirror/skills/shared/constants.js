@@ -1,5 +1,6 @@
 export const STATUSES = {
   PENDING: "pending",
+  PENDING_REASON: "pending_reason",
   APPROVED: "approved",
   REJECTED: "rejected",
   MODIFYING: "modifying",
