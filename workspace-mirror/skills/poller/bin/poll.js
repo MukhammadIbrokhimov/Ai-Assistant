@@ -22,6 +22,7 @@ import { createCancelCommand } from "../commands/cancel.js";
 import { createRouter } from "../../provider-router/router.js";
 import ollamaAdapter from "../../provider-router/providers/ollama.js";
 import anthropicAdapter from "../../provider-router/providers/anthropic.js";
+import { withRejectionPreamble } from "shared/rejection-preamble";
 
 // Paths
 const workspacePath = join(homedir(), ".openclaw", "workspace");
@@ -59,11 +60,12 @@ const draftStore = createDraftStore(draftsPath);
 const sourcesStore = createSourcesStore({ path: join(configDir, "sources.yaml") });
 
 // Wire provider-router (M2) — modify flow now works end-to-end
-const router = createRouter({
+const baseRouter = createRouter({
   configPath: providersPath,
   adapters: { ollama: ollamaAdapter, anthropic: anthropicAdapter },
   logPath: join(draftsPath, "logs", "router.jsonl"),
 });
+const router = withRejectionPreamble({ router: baseRouter, draftsRoot: draftsPath });
 
 // Source-discovery callback handler (s: prefix)
 const pendingSourceRoot = join(draftsPath, "pending-source");
