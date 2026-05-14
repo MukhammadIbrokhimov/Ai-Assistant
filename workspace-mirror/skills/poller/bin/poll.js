@@ -115,6 +115,7 @@ const loop = createPollLoop({
   pairedUserId,
   commands,
   sourceCb,
+  draftsRoot: draftsPath,
 });
 
 // Graceful shutdown

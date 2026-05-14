@@ -1,4 +1,7 @@
 import { CALLBACK_PREFIXES, STATUSES } from "shared/constants";
+import { appendRejection } from "shared/rejection-log";
+
+const REASON_TIMEOUT_MS = 5 * 60 * 1000;
 
 export function isFromPairedUser(update, pairedUserId) {
   const from = update.callback_query?.from || update.message?.from;
@@ -50,13 +53,21 @@ export async function handleCallback(cbq, { telegramClient, draftStore, archive,
     await archive.archiveDraft(draftId, { draftStore, telegramClient });
   } else if (action === "reject") {
     await telegramClient.answerCallbackQuery(cbq.id, "Rejected");
-    draftStore.updateState(draftId, { status: STATUSES.REJECTED, resolved_at: now });
     await telegramClient.editMessageText(
       chatId,
       messageId,
-      `~${draft.caption}~\n\n❌ Rejected`
+      `~${draft.caption}~\n\n❌ Rejected — awaiting reason`
     ).catch((err) => console.error(`editMessageText failed for ${draftId}:`, err));
-    await archive.archiveDraft(draftId, { draftStore, telegramClient });
+    const prompt = await telegramClient.sendMessage(
+      chatId,
+      "Reason? (helps tune future drafts) — or /skip",
+      { reply_markup: { force_reply: true } }
+    );
+    draftStore.updateState(draftId, {
+      status: STATUSES.PENDING_REASON,
+      reason_prompt_message_id: prompt?.message_id ?? null,
+      reason_asked_at: now,
+    });
   } else if (action === "modify") {
     const existing = draftStore.findModifying();
     if (existing) {
@@ -74,6 +85,67 @@ export async function handleCallback(cbq, { telegramClient, draftStore, archive,
     );
     draftStore.updateState(draftId, { status: STATUSES.MODIFYING });
   }
+}
+
+export async function handleReasonReply(
+  message,
+  { telegramClient, draftStore, archive, draftsRoot, now = () => new Date() }
+) {
+  const pendingId = draftStore.findPendingReason?.();
+  if (!pendingId) return false;
+
+  const text = message.text?.trim() ?? "";
+  const isSkip = text === "/skip";
+  const reason = isSkip ? null : (text || null);
+
+  const { draft } = draftStore.readDraft(pendingId);
+  const ts = now().toISOString();
+
+  appendRejection(draftsRoot, {
+    ts,
+    draft_id: pendingId,
+    mode: draft?.mode ?? null,
+    topic: draft?.topic ?? null,
+    reason,
+  });
+
+  draftStore.updateState(pendingId, {
+    status: STATUSES.REJECTED,
+    resolved_at: ts,
+    reject_reason: reason,
+  });
+  await archive.archiveDraft(pendingId, { draftStore, telegramClient });
+  return true;
+}
+
+export async function sweepExpiredReasonWaits({
+  draftStore,
+  archive,
+  telegramClient,
+  draftsRoot,
+  now = () => new Date(),
+}) {
+  const pendingId = draftStore.findPendingReason?.();
+  if (!pendingId) return false;
+  const { draft, state } = draftStore.readDraft(pendingId);
+  const askedMs = state?.reason_asked_at ? new Date(state.reason_asked_at).getTime() : null;
+  if (!askedMs || now().getTime() - askedMs < REASON_TIMEOUT_MS) return false;
+
+  const ts = now().toISOString();
+  appendRejection(draftsRoot, {
+    ts,
+    draft_id: pendingId,
+    mode: draft?.mode ?? null,
+    topic: draft?.topic ?? null,
+    reason: null,
+  });
+  draftStore.updateState(pendingId, {
+    status: STATUSES.REJECTED,
+    resolved_at: ts,
+    reject_reason: null,
+  });
+  await archive.archiveDraft(pendingId, { draftStore, telegramClient });
+  return true;
 }
 
 export async function handleModifyReply(message, { telegramClient, draftStore, router, approval }) {
@@ -118,7 +190,17 @@ export async function handleModifyReply(message, { telegramClient, draftStore, r
   await approval.sendForApproval(newId, { telegramClient, draftStore, chatId });
 }
 
-export function createPollLoop({ telegramClient, draftStore, archive, approval, router, pairedUserId, commands, sourceCb }) {
+export function createPollLoop({
+  telegramClient,
+  draftStore,
+  archive,
+  approval,
+  router,
+  pairedUserId,
+  commands,
+  sourceCb,
+  draftsRoot,
+}) {
   let running = true;
   let offset = 0;
   let backoff = 1000;
@@ -144,35 +226,54 @@ export function createPollLoop({ telegramClient, draftStore, archive, approval, 
                 archive,
                 sourceCb,
               });
-            } else if (update.message?.text?.startsWith("/")) {
-              const text = update.message.text;
-              const chatId = update.message.chat.id;
-              const spaceIdx = text.indexOf(" ");
-              const name = (spaceIdx === -1 ? text : text.slice(0, spaceIdx))
-                .slice(1)
-                .toLowerCase();
-              const args = spaceIdx === -1 ? "" : text.slice(spaceIdx + 1).trim();
-              const handler = commands[name];
-              if (handler) {
-                await handler(chatId, args, telegramClient);
-              } else {
-                await telegramClient.sendMessage(
-                  chatId,
-                  "Unknown command. Try /help"
-                );
-              }
             } else if (update.message?.text) {
-              await handleModifyReply(update.message, {
+              // While a draft is awaiting a reject reason, ANY text from the
+              // paired user (including "/skip") is treated as the reason —
+              // commands and modify-flow are suspended for that brief window.
+              const handledAsReason = await handleReasonReply(update.message, {
                 telegramClient,
                 draftStore,
-                router,
-                approval,
+                archive,
+                draftsRoot,
               });
+              if (!handledAsReason) {
+                if (update.message.text.startsWith("/")) {
+                  const text = update.message.text;
+                  const chatId = update.message.chat.id;
+                  const spaceIdx = text.indexOf(" ");
+                  const name = (spaceIdx === -1 ? text : text.slice(0, spaceIdx))
+                    .slice(1)
+                    .toLowerCase();
+                  const args = spaceIdx === -1 ? "" : text.slice(spaceIdx + 1).trim();
+                  const handler = commands[name];
+                  if (handler) {
+                    await handler(chatId, args, telegramClient);
+                  } else {
+                    await telegramClient.sendMessage(
+                      chatId,
+                      "Unknown command. Try /help"
+                    );
+                  }
+                } else {
+                  await handleModifyReply(update.message, {
+                    telegramClient,
+                    draftStore,
+                    router,
+                    approval,
+                  });
+                }
+              }
             }
           } catch (err) {
             console.error(`Error handling update ${update.update_id}:`, err);
           }
         }
+        await sweepExpiredReasonWaits({
+          draftStore,
+          archive,
+          telegramClient,
+          draftsRoot,
+        }).catch((err) => console.error("sweepExpiredReasonWaits failed:", err));
       } catch (err) {
         console.error(`getUpdates failed, retrying in ${backoff}ms:`, err);
         await new Promise((r) => setTimeout(r, backoff));
