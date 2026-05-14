@@ -17,6 +17,7 @@ function makeDeps(overrides = {}) {
     ]),
     downloadAudio: vi.fn(async (videoId, dest) => dest),
     downloadVideo: vi.fn(async (videoId, dest) => dest),
+    transcribe: { run: vi.fn(async () => ({ transcript: {}, path: "/fake.json" })) },
     readManifest: vi.fn(() => ({ episodes: [] })),
     writeManifest: vi.fn(),
     mkdirp: vi.fn(),
@@ -72,6 +73,68 @@ describe("whitelist-scan", () => {
     const scan = createWhitelistScan(deps);
     const result = await scan.run();
     expect(deps.downloadAudio).not.toHaveBeenCalled();
+    expect(deps.transcribe.run).not.toHaveBeenCalled();
     expect(result.downloaded).toBe(0);
+  });
+
+  it("invokes transcribe.run for each newly downloaded episode with correct args", async () => {
+    const deps = makeDeps();
+    const scan = createWhitelistScan(deps);
+    const result = await scan.run();
+
+    expect(deps.transcribe.run).toHaveBeenCalledTimes(1);
+    const callArgs = deps.transcribe.run.mock.calls[0][0];
+    expect(callArgs).toEqual({
+      audioPath: "/tmp/whitelist-cache/audio-cache/lex-fridman/vid1.m4a",
+      sourceId: "lex-fridman",
+      episodeId: "vid1",
+      title: "Episode 999",
+      durationS: 7200,
+    });
+    expect(result.transcribed).toBe(1);
+    expect(result.transcribe_failed).toBe(0);
+  });
+
+  it("skips episode (no manifest entry, no downloaded++) when transcribe throws, continues with next episode", async () => {
+    const deps = makeDeps({
+      listNewVideos: vi.fn(async () => [
+        { id: "fail1", title: "Will fail", duration_s: 60, published_at: "2026-04-15T10:00:00Z" },
+        { id: "ok1", title: "Will succeed", duration_s: 120, published_at: "2026-04-15T11:00:00Z" },
+      ]),
+      transcribe: {
+        run: vi.fn(async ({ episodeId }) => {
+          if (episodeId === "fail1") throw new Error("whisper crashed");
+          return { transcript: {}, path: "/fake.json" };
+        }),
+      },
+    });
+    const scan = createWhitelistScan(deps);
+    const result = await scan.run();
+
+    // Both episodes attempted
+    expect(deps.transcribe.run).toHaveBeenCalledTimes(2);
+    // Manifest written, but only the successful episode is in it
+    expect(deps.writeManifest).toHaveBeenCalledTimes(1);
+    const writtenManifest = deps.writeManifest.mock.calls[0][1];
+    expect(writtenManifest.episodes).toHaveLength(1);
+    expect(writtenManifest.episodes[0].episode_id).toBe("ok1");
+    // Counters reflect outcome
+    expect(result.downloaded).toBe(1);
+    expect(result.transcribed).toBe(1);
+    expect(result.transcribe_failed).toBe(1);
+    // Source still marked as scanned (don't keep listing the same episodes forever)
+    expect(deps.sourcesStore.updateLastScanned).toHaveBeenCalled();
+  });
+
+  it("transcribe runs AFTER both downloads complete", async () => {
+    const callOrder = [];
+    const deps = makeDeps({
+      downloadAudio: vi.fn(async () => { callOrder.push("audio"); }),
+      downloadVideo: vi.fn(async () => { callOrder.push("video"); }),
+      transcribe: { run: vi.fn(async () => { callOrder.push("transcribe"); }) },
+    });
+    const scan = createWhitelistScan(deps);
+    await scan.run();
+    expect(callOrder).toEqual(["audio", "video", "transcribe"]);
   });
 });
