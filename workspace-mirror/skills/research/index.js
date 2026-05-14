@@ -1,8 +1,8 @@
 import yaml from "js-yaml";
 import { parseRssFeed } from "./rss.js";
 
-export function createResearch({ readFileSync, nichesPath, fetchRss, browserSearch, router }) {
-  const rssFetcher = fetchRss || parseRssFeed;
+export function createResearch({ readFileSync, nichesPath, fetchRss, browserSearch, router, logger }) {
+  const rssFetcher = fetchRss || ((url) => parseRssFeed(url, { logger }));
 
   async function run(niche) {
     const doc = yaml.load(readFileSync(nichesPath, "utf8"));
@@ -44,7 +44,19 @@ export function createResearch({ readFileSync, nichesPath, fetchRss, browserSear
       return true;
     });
 
-    if (filtered.length === 0) return [];
+    const emitCounts = (extra = {}) => logger?.jsonl?.({
+      event: "research_stage_counts",
+      niche,
+      rss: rssItems.length,
+      web: webItems.length,
+      filtered: filtered.length,
+      ...extra,
+    });
+
+    if (filtered.length === 0) {
+      emitCounts({ deduped: 0, ranked: 0 });
+      return [];
+    }
 
     // 4. LLM dedupe → indices to keep
     const dedupePrompt = `You will receive an array of headlines. Identify which ones are near-duplicates of each other (same story, different sources). Return a JSON object: {"keep":[indices]} listing indices (0-based) of items to KEEP (one per unique story). Headlines:\n${filtered.map((it, i) => `[${i}] ${it.title}`).join("\n")}\n\nReturn ONLY the JSON.`;
@@ -76,7 +88,9 @@ export function createResearch({ readFileSync, nichesPath, fetchRss, browserSear
         topic: it.title, source_url: it.source_url, score: 1 - i * 0.1,
       }));
     }
-    return ranked.slice(0, 5).map(r => ({ ...r, niche }));
+    const out = ranked.slice(0, 5).map(r => ({ ...r, niche }));
+    emitCounts({ deduped: deduped.length, ranked: out.length });
+    return out;
   }
 
   return { run };

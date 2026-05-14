@@ -73,6 +73,7 @@ async function loadSkillsAndRouter() {
     nichesPath: `${WORKSPACE}/config/niches.yaml`,
     browserSearch: async () => [],
     router,
+    logger,
   });
 
   const pexels = process.env.PEXELS_API_KEY
