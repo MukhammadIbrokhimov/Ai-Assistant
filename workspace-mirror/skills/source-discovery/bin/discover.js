@@ -10,6 +10,10 @@ import { formatCandidateMessage, candidateInlineKeyboard } from "../approval-for
 
 const args = Object.fromEntries(process.argv.slice(2).map(a => a.split("=").map(s => s.replace(/^--/, ""))));
 if (!args.url && !args.niche) { console.error("Usage: bin/discover.js --url=<url> [--niche=ai]  OR  --niche=ai"); process.exit(1); }
+if (!process.env.YOUTUBE_API_KEY) {
+  console.error("discover.js requires YOUTUBE_API_KEY env var (free quota at https://console.cloud.google.com/apis/credentials)");
+  process.exit(2);
+}
 
 const router = createRouter({
   configPath: `${process.env.HOME}/.openclaw/workspace/config/providers.yaml`,
