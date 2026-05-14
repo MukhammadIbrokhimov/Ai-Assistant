@@ -68,7 +68,14 @@ export function createWhisperRunner({
     }
     const srtPath = `${wavPath}.srt`;
     try {
-      await runProcess(spawn, binary, ["-m", modelPath, "-l", "en", "-osrt", "-of", wavPath, wavPath]);
+      // Anti-hallucination flags. -nc disables conditioning on previous
+      // segment text, which was the root of the 17-min loop on sparse-speech
+      // audio (KGVpKPNUdzA fixture: same phrase repeated t=298s..1321s).
+      await runProcess(spawn, binary, [
+        "-m", modelPath, "-l", "en",
+        "-nth", "0.6", "-et", "2.4", "-wt", "0.01", "-nc",
+        "-osrt", "-of", wavPath, wavPath,
+      ]);
       return readFileSync(srtPath, "utf8");
     } finally {
       for (const p of [tempWav, srtPath]) {
