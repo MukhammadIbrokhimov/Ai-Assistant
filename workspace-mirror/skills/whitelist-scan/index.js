@@ -2,7 +2,7 @@ import { join } from "node:path";
 
 export function createWhitelistScan(deps) {
   const {
-    sourcesStore, listNewVideos, downloadAudio, downloadVideo,
+    sourcesStore, listNewVideos, downloadAudio, downloadVideo, transcribe,
     readManifest, writeManifest, mkdirp,
     freeSpaceBytes, now, cacheRoot, minFreeGb = 5,
   } = deps;
@@ -22,7 +22,7 @@ export function createWhitelistScan(deps) {
 
     const nowDate = now();
     const sources = sourcesStore.list();
-    let downloaded = 0, skipped = 0, failed = 0;
+    let downloaded = 0, transcribed = 0, transcribe_failed = 0, skipped = 0, failed = 0;
 
     for (const s of sources) {
       if (!shouldScan(s, nowDate)) { skipped++; continue; }
@@ -43,6 +43,26 @@ export function createWhitelistScan(deps) {
           const videoPath = join(videoDir, `${ep.id}.mp4`);
           await downloadAudio(ep.id, audioPath);
           await downloadVideo(ep.id, videoPath);
+
+          // Transcribe inline so the next daily-loop's clip pool has it.
+          // On failure, skip the episode (don't add to manifest) so the next
+          // scan retries the whole episode — keeps manifest+transcript pair
+          // consistent for loadTranscripts().
+          try {
+            await transcribe.run({
+              audioPath,
+              sourceId: s.id,
+              episodeId: ep.id,
+              title: ep.title,
+              durationS: ep.duration_s,
+            });
+            transcribed++;
+          } catch (terr) {
+            transcribe_failed++;
+            console.error(`transcribe failed for ${s.id}/${ep.id}: ${terr.message}`);
+            continue;
+          }
+
           manifest.episodes.push({
             episode_id: ep.id,
             title: ep.title,
@@ -62,7 +82,7 @@ export function createWhitelistScan(deps) {
         console.error(`scan failed for ${s.id}: ${e.message}`);
       }
     }
-    return { downloaded, skipped, failed };
+    return { downloaded, transcribed, transcribe_failed, skipped, failed };
   }
 
   return { run };
