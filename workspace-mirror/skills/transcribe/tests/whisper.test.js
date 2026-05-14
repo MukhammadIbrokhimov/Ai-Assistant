@@ -88,6 +88,25 @@ describe("createWhisperRunner", () => {
     expect(calls.map(c => c.binary)).toEqual(["whisper-cli"]);
   });
 
+  it("passes anti-hallucination flags to whisper-cli (-nc + thresholds)", async () => {
+    const tmp = mkdtempSync(join(tmpdir(), "wt-"));
+    const wavPath = join(tmp, "a.wav");
+    writeFileSync(wavPath, "");
+    const { spawn, calls } = fakeSpawn({
+      "whisper-cli": ({ args }) => {
+        const of = args[args.indexOf("-of") + 1];
+        writeFileSync(`${of}.srt`, "1\n00:00:00,000 --> 00:00:01,000\nhi\n");
+      },
+    });
+    const runner = createWhisperRunner({ modelPath: "/fake.bin", spawn });
+    await runner.runWhisper(wavPath);
+    const args = calls[0].args;
+    expect(args).toContain("-nc");
+    expect(args[args.indexOf("-nth") + 1]).toBe("0.6");
+    expect(args[args.indexOf("-et") + 1]).toBe("2.4");
+    expect(args[args.indexOf("-wt") + 1]).toBe("0.01");
+  });
+
   it("converts m4a to wav via ffmpeg before running whisper-cli", async () => {
     const tmp = mkdtempSync(join(tmpdir(), "wt-"));
     const m4aPath = join(tmp, "a.m4a");
