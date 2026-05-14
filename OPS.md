@@ -35,6 +35,25 @@ Compares each job's most recent expected fire (from `workspace-mirror/config/cro
 
 Schedule it daily (suggested 09:30 — just after `daily-loop` at 09:00) by adding to `cron.yaml`, or run it manually after any extended sleep.
 
+## Healthchecks.io watchdog
+
+External liveness alert: every 5 min the daemon pings a healthchecks.io URL; if the pings stop arriving for longer than the channel's grace window (15 min by default), healthchecks.io alerts the user via whatever integrations are configured on its side (SMS, email, Telegram, etc.). Unlike cron-drift, this catches the case where the *machine itself* is unreachable.
+
+**Setup.**
+
+1. Create a check at healthchecks.io with a 15-minute period and copy its ping URL.
+2. Add to `~/.openclaw/workspace/.env`:
+   ```
+   OPENCLAW_HEALTHCHECK_URL=https://hc-ping.com/<uuid>
+   ```
+3. Install the launchd job:
+   ```bash
+   node workspace-mirror/scripts/install-healthcheck.mjs
+   ```
+   `--dry-run` previews; `--uninstall` removes it.
+
+Pings are logged to `~/openclaw-drafts/logs/launchd-healthcheck-ping.log`. The ping script always exits 0 — an outage is detected externally by healthchecks.io when pings stop, not by launchd marking the job as failed.
+
 ## Bootstrapping a clean clone
 
 ```bash
