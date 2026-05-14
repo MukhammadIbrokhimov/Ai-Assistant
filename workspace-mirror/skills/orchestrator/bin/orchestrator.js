@@ -18,6 +18,9 @@ const sandbox = !!arg("sandbox", false);
 const DRAFTS = sandbox ? "/tmp/openclaw-smoke" : `${HOME}/openclaw-drafts`;
 const WORKSPACE = `${HOME}/.openclaw/workspace`;
 
+mkdirSync(`${DRAFTS}/state`, { recursive: true });
+mkdirSync(`${DRAFTS}/logs`, { recursive: true });
+
 const logger = createLogger(`${DRAFTS}/logs/agent.jsonl`);
 const quietQueue = createQuietQueue({ path: `${DRAFTS}/state/quiet-queue.jsonl` });
 

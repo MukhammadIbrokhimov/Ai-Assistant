@@ -26,13 +26,13 @@ function makeDeps(overrides = {}) {
             text: JSON.stringify([
               { start_s: 1830.0, end_s: 1877.0, reasoning: "hook quote", hook_quote: "AI agents won't replace junior devs" },
             ]),
-            tokens_in: 5000, tokens_out: 200,
+            tokensIn: 5000, tokensOut: 200, providerUsed: "ollama:qwen2.5:14b",
           };
         }
         if (taskClass === "write") {
           const calls = deps.router.complete.mock.calls.length;
-          if (calls === 2) return { text: "Sam Altman on why agents won't replace devs.", tokens_in: 100, tokens_out: 30 };
-          if (calls === 3) return { text: "#ai #agents #dev #coding #future #software #tech #growth #career #podcast", tokens_in: 50, tokens_out: 20 };
+          if (calls === 2) return { text: "Sam Altman on why agents won't replace devs.", tokensIn: 100, tokensOut: 30, providerUsed: "ollama:qwen2.5:14b" };
+          if (calls === 3) return { text: "#ai #agents #dev #coding #future #software #tech #growth #career #podcast", tokensIn: 50, tokensOut: 20, providerUsed: "ollama:qwen2.5:14b" };
         }
         throw new Error(`unexpected ${taskClass}`);
       }),
@@ -93,5 +93,15 @@ describe("clip-extract", () => {
     const source = { id: "lex-fridman", title: "Lex Fridman", license: "permission-granted", attribution_template: "🎙️ From {episode_title}" };
     const { draft } = await ce.run({ transcript: TRANSCRIPT, source, videoPath: "/fake/ep999.mp4" });
     expect(draft.source.attribution).toContain("Lex Fridman #999");
+  });
+
+  it("draft records non-zero tokens_in/tokens_out and provider_used from router response", async () => {
+    deps = makeDeps();
+    const ce = createClipExtract(deps);
+    const source = { id: "lex-fridman", title: "Lex Fridman", license: "permission-granted", attribution_template: "🎙️ From {episode_title}" };
+    const { draft } = await ce.run({ transcript: TRANSCRIPT, source, videoPath: "/fake/ep999.mp4" });
+    expect(draft.tokens_in).toBe(5000 + 100 + 50);
+    expect(draft.tokens_out).toBe(200 + 30 + 20);
+    expect(draft.provider_used).toBe("ollama:qwen2.5:14b");
   });
 });

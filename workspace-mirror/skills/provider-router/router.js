@@ -1,6 +1,6 @@
 import { readFileSync, writeFileSync, appendFileSync } from "node:fs";
 import yaml from "js-yaml";
-import { todaySpendUsd } from "./spend.js";
+import { computeCost, todaySpendUsd } from "./spend.js";
 
 const TASK_CLASSES = new Set(["bulk-classify", "extract", "reason", "write"]);
 
@@ -93,8 +93,9 @@ export function createRouter({ configPath, adapters, logPath }) {
       try {
         result = await adapter.complete(adapterArgs);
         const providerUsed = `${providerName}:${modelName}`;
+        const cost_usd = computeCost(providerUsed, result.tokensIn ?? 0, result.tokensOut ?? 0, config.spend?.cost_per_million_tokens ?? {});
         logCall({ ts, providerName, modelName, taskClass, ok: true,
-          tokensIn: result.tokensIn, tokensOut: result.tokensOut, latencyMs: result.latencyMs });
+          tokensIn: result.tokensIn, tokensOut: result.tokensOut, latencyMs: result.latencyMs, cost_usd });
         return { ...result, providerUsed };
       } catch (e) {
         lastErr = e;
@@ -118,9 +119,10 @@ export function createRouter({ configPath, adapters, logPath }) {
       try {
         const fbResult = await fbAdapter.complete(fbArgs);
         const providerUsed = `${fb.providerName}:${fb.modelName}`;
+        const cost_usd = computeCost(providerUsed, fbResult.tokensIn ?? 0, fbResult.tokensOut ?? 0, config.spend?.cost_per_million_tokens ?? {});
         logCall({ ts: fbTs, providerName: fb.providerName, modelName: fb.modelName,
           taskClass, ok: true, fallback: true,
-          tokensIn: fbResult.tokensIn, tokensOut: fbResult.tokensOut, latencyMs: fbResult.latencyMs });
+          tokensIn: fbResult.tokensIn, tokensOut: fbResult.tokensOut, latencyMs: fbResult.latencyMs, cost_usd });
         return { ...fbResult, providerUsed };
       } catch (e) {
         logCall({ ts: new Date().toISOString(), providerName: fb.providerName, modelName: fb.modelName,

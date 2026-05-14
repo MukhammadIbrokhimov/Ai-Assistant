@@ -66,9 +66,9 @@ Return ONLY the JSON array.`;
         attribution,
         clip_range: [pick.start_s, pick.end_s],
       },
-      provider_used: pickResp.provider || null,
-      tokens_in: (pickResp.tokens_in || 0) + (capResp.tokens_in || 0) + (hashResp.tokens_in || 0),
-      tokens_out: (pickResp.tokens_out || 0) + (capResp.tokens_out || 0) + (hashResp.tokens_out || 0),
+      provider_used: pickResp.providerUsed || null,
+      tokens_in: (pickResp.tokensIn || 0) + (capResp.tokensIn || 0) + (hashResp.tokensIn || 0),
+      tokens_out: (pickResp.tokensOut || 0) + (capResp.tokensOut || 0) + (hashResp.tokensOut || 0),
       status: "pending",
       parent_id: null,
     };
