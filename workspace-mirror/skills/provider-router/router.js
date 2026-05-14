@@ -4,7 +4,7 @@ import { computeCost, todaySpendUsd } from "./spend.js";
 
 const TASK_CLASSES = new Set(["bulk-classify", "extract", "reason", "write"]);
 
-export function createRouter({ configPath, adapters, logPath }) {
+export function createRouter({ configPath, adapters, logPath, onCapHit }) {
   let config = loadAndValidate(configPath);
 
   function loadAndValidate(path) {
@@ -67,8 +67,20 @@ export function createRouter({ configPath, adapters, logPath }) {
     const cap = config.spend?.daily_cap_usd ?? Infinity;
     const spent = todaySpendUsd(logPath, config.spend?.cost_per_million_tokens ?? {});
     if (spent >= cap && config.current_mode !== "local") {
+      const prevMode = config.current_mode;
       config.current_mode = "local";
       persist();
+      const hitTs = new Date().toISOString();
+      if (logPath) {
+        appendFileSync(logPath, JSON.stringify({
+          ts: hitTs, kind: "event", event: "spend_cap_hit",
+          spent_usd: spent, cap_usd: cap, prev_mode: prevMode,
+        }) + "\n");
+      }
+      if (onCapHit) {
+        try { await onCapHit({ ts: hitTs, spentUsd: spent, capUsd: cap, prevMode }); }
+        catch (e) { /* notification failure must not break the call */ }
+      }
     }
 
     const { providerName, providerCfg, modelName } = resolveTarget(taskClass);

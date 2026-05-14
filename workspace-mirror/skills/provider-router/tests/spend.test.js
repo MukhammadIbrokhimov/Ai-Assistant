@@ -86,6 +86,58 @@ describe("router with spend cap", () => {
     expect(router.getMode()).toBe("local");
   });
 
+  test("cap-hit transition emits spend_cap_hit event AND fires onCapHit exactly once", async () => {
+    const ollama = { name: "ollama", complete: vi.fn().mockResolvedValue({
+      text: "local", tokensIn: 1, tokensOut: 1, latencyMs: 1 }) };
+    const anthropic = { name: "anthropic", complete: vi.fn().mockResolvedValue({
+      text: "anthropic", tokensIn: 1_000_000, tokensOut: 1_000_000, latencyMs: 1 }) };
+    const onCapHit = vi.fn();
+    const router = createRouter({
+      configPath, adapters: { ollama, anthropic }, logPath, onCapHit,
+    });
+
+    // First call: under cap, no event.
+    await router.complete({ taskClass: "write", prompt: "x" });
+    expect(onCapHit).toHaveBeenCalledTimes(0);
+
+    // Second call: spend now exceeds cap, transition fires.
+    await router.complete({ taskClass: "write", prompt: "y" });
+    expect(onCapHit).toHaveBeenCalledTimes(1);
+    const arg = onCapHit.mock.calls[0][0];
+    expect(arg.spentUsd).toBeGreaterThan(0.001);
+    expect(arg.capUsd).toBe(0.001);
+    expect(arg.prevMode).toBe("hybrid");
+    expect(arg.ts).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+
+    // Third call: already in local mode, no re-fire.
+    await router.complete({ taskClass: "write", prompt: "z" });
+    expect(onCapHit).toHaveBeenCalledTimes(1);
+
+    // router.jsonl contains exactly one spend_cap_hit event with required fields.
+    const lines = readFileSync(logPath, "utf8").trim().split("\n").map(JSON.parse);
+    const hits = lines.filter(l => l.event === "spend_cap_hit");
+    expect(hits).toHaveLength(1);
+    expect(hits[0].spent_usd).toBeGreaterThan(0.001);
+    expect(hits[0].cap_usd).toBe(0.001);
+    expect(hits[0].prev_mode).toBe("hybrid");
+    expect(hits[0].ts).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+  });
+
+  test("onCapHit failure does not break the originating call", async () => {
+    const ollama = { name: "ollama", complete: vi.fn().mockResolvedValue({
+      text: "local", tokensIn: 1, tokensOut: 1, latencyMs: 1 }) };
+    const anthropic = { name: "anthropic", complete: vi.fn().mockResolvedValue({
+      text: "anthropic", tokensIn: 1_000_000, tokensOut: 1_000_000, latencyMs: 1 }) };
+    const onCapHit = vi.fn().mockRejectedValue(new Error("telegram down"));
+    const router = createRouter({
+      configPath, adapters: { ollama, anthropic }, logPath, onCapHit,
+    });
+    await router.complete({ taskClass: "write", prompt: "x" });
+    const res = await router.complete({ taskClass: "write", prompt: "y" });
+    expect(res.text).toBe("local");
+    expect(onCapHit).toHaveBeenCalledTimes(1);
+  });
+
   test("todaySpendUsd reads router.jsonl and sums today's costs", async () => {
     const today = new Date().toISOString().slice(0, 10);
     writeFileSync(logPath, [

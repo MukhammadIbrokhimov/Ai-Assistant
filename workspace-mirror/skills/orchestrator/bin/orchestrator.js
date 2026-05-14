@@ -43,20 +43,25 @@ async function loadSkillsAndRouter() {
   const { createDraftStore } = await import(`${WORKSPACE}/skills/shared/draft-store.js`);
   const { sendForApproval } = await import(`${WORKSPACE}/skills/approval/approval.js`);
 
+  const tgConfig = yaml.load(readFileSync(`${WORKSPACE}/config/telegram.yaml`, "utf8"));
+  const token = process.env[tgConfig.bot_token_env] || process.env.TG_BOT_TOKEN;
+  const chatId = tgConfig.paired_user_id;
+  const telegramClient = createTelegramClient(token);
+
   const baseRouter = createRouter({
     configPath: `${WORKSPACE}/config/providers.yaml`,
     adapters: { ollama, anthropic },
     logPath: `${DRAFTS}/logs/router.jsonl`,
+    onCapHit: async ({ spentUsd, capUsd }) => {
+      if (!telegramClient || !chatId) return;
+      const msg = `⚠️ Spend cap $${capUsd.toFixed(2)} hit (today: $${spentUsd.toFixed(2)}) — reverted to local mode for the rest of today.`;
+      await telegramClient.sendMessage(chatId, msg);
+    },
   });
   const { withRejectionPreamble } = await import(`${WORKSPACE}/skills/shared/rejection-preamble.js`);
   const router = withRejectionPreamble({ router: baseRouter, draftsRoot: DRAFTS });
 
   const draftStore = createDraftStore(DRAFTS);
-
-  const tgConfig = yaml.load(readFileSync(`${WORKSPACE}/config/telegram.yaml`, "utf8"));
-  const token = process.env[tgConfig.bot_token_env] || process.env.TG_BOT_TOKEN;
-  const chatId = tgConfig.paired_user_id;
-  const telegramClient = createTelegramClient(token);
 
   const commonWriteDraft = (id, d) => {
     const dir = `${DRAFTS}/pending/${id}`;
