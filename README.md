@@ -14,8 +14,17 @@ Coordinates multiple AI agents to ideate, produce, and schedule short-form socia
 
 - `AGENTS.md`, `CLAUDE.md` — agent instructions and task context
 - `.claude/`, `.beads/` — agent tooling configuration (Claude Code + Beads task tracker)
-- `docs/` — design notes and decisions
+- `OPS.md` — operational runbooks (gateway re-pair, cron-drift checks, clean-clone bootstrap)
+- `docs/` — design notes and decisions (not tracked; local-only)
 - `workspace-mirror/` — per-agent isolated workspaces
+
+## Getting started
+
+```bash
+node workspace-mirror/scripts/setup.mjs   # npm install in every skill + scripts dir
+```
+
+See [OPS.md](OPS.md) for operational runbooks (gateway re-pair, cron-drift detection).
 
 ## Deploying to the live workspace
 
