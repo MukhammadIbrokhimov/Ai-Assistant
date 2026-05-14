@@ -31,6 +31,15 @@ const LIVE = args.includes("--live");
 const SANDBOX = args.includes("--sandbox");
 const ORCHESTRATOR = args.includes("--orchestrator");
 const draftsRoot = SANDBOX ? "/tmp/openclaw-smoke" : DRAFTS;
+
+// smoke-run reads providers.yaml, telegram.yaml, niches.yaml, sources.yaml, and
+// the Python venv from ~/.openclaw/workspace/ regardless of OPENCLAW_LIVE. Fail
+// fast with a focused setup pointer if the live workspace is not seeded yet.
+if (!existsSync(LIVE_WS)) {
+  console.error(`smoke-run requires ${LIVE_WS}/. Seed it from this checkout: rsync -a ${MIRROR}/ ${LIVE_WS}/`);
+  process.exit(2);
+}
+
 mkdirSync(`${draftsRoot}/pending`, { recursive: true });
 
 if (ORCHESTRATOR) {
