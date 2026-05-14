@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -131,5 +131,26 @@ describe("router.complete", () => {
       logPath: join(tmp, "router.jsonl"),
     });
     await expect(router.setMode("nonsense")).rejects.toThrow(/unknown mode/i);
+  });
+
+  test("router.jsonl call entries include cost_usd computed from spend config", async () => {
+    process.env.ANTHROPIC_API_KEY = "sk-ant-test";
+    const ollama = { name: "ollama", complete: vi.fn() };
+    const anthropic = { name: "anthropic", complete: vi.fn().mockResolvedValue({
+      text: "ok", tokensIn: 5, tokensOut: 3, latencyMs: 100 }) };
+
+    const logPath = join(tmp, "router.jsonl");
+    const router = createRouter({
+      configPath, adapters: { ollama, anthropic }, logPath,
+    });
+    await router.setMode("hybrid");
+    await router.complete({ taskClass: "write", prompt: "x" });
+
+    const lines = readFileSync(logPath, "utf8").trim().split("\n").map(JSON.parse);
+    const call = lines.find(l => l.kind === "call" && l.ok);
+    expect(call).toBeDefined();
+    // anthropic:claude-sonnet-4-6 costs $3/M in, $15/M out:
+    //   (5 / 1_000_000) * 3 + (3 / 1_000_000) * 15 = 0.00006
+    expect(call.cost_usd).toBeCloseTo(0.00006, 8);
   });
 });
