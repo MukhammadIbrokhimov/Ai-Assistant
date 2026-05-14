@@ -10,6 +10,16 @@ To restore from this mirror onto a fresh laptop:
   rsync -a workspace-mirror/ ~/.openclaw/workspace/
   # then re-create ~/.openclaw/workspace/.env from your password manager
 
+Required env vars in `~/.openclaw/workspace/.env`:
+
+  - `TG_BOT_TOKEN`         — Telegram bot token (BotFather)
+  - `TG_PAIRED_USER_ID`    — your Telegram numeric user id
+  - `ANTHROPIC_API_KEY`    — Claude API (console.anthropic.com)
+  - `OPENAI_API_KEY`       — Whisper transcription (platform.openai.com)
+  - `PEXELS_API_KEY`       — stock images for slideshow drafts (pexels.com/api)
+  - `YOUTUBE_API_KEY`      — channel discovery, weekly source-discovery-pull cron
+                             (free quota, console.cloud.google.com/apis/credentials)
+
 Plan A populated:
   - skills/provider-router/   (full)
   - config/*.yaml             (all 5 configs)
